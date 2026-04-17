@@ -29,6 +29,7 @@ st.caption("Focus: High Liquidity | > 10 Days to Earnings | Strategic Premium")
 # ──────────────────────────────────────────────
 with st.sidebar:
     st.header("Strategic Filters")
+    # Focused on your priorities: Quality + Volatility + Liquidity
     ticker_str = st.text_area("Ticker Universe", 
                              "NVDA, AMD, COIN, MSTR, AMZN, PLTR, HOOD, MARA, AAPL, DIS, CRM, SQ, SHOP, GOOGL")
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
@@ -46,13 +47,14 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
     progress = st.progress(0)
     status = st.empty()
     
-    # Static Dates for April/May 2026 cycle to prevent '99 days' API glitch
+    # Static Dates for April/May 2026 to bypass '99-day' API glitches
+    # TSLA (4/22) and META (4/22) will be filtered out by your 10-day rule
     DATES_2026 = {
         "TSLA": datetime(2026, 4, 22), "MSFT": datetime(2026, 4, 28),
         "GOOGL": datetime(2026, 4, 29), "AMZN": datetime(2026, 4, 29),
         "NVDA": datetime(2026, 5, 20), "AMD": datetime(2026, 4, 30),
         "AAPL": datetime(2026, 5, 7), "COIN": datetime(2026, 5, 14),
-        "META": datetime(2026, 4, 22)
+        "META": datetime(2026, 4, 22), "MSTR": datetime(2026, 5, 4)
     }
 
     for i, symbol in enumerate(TICKERS):
@@ -61,64 +63,8 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
         
         try:
             t = yf.Ticker(symbol)
-            hist = t.history(period="200d")
+            hist = t.history(period="150d")
             if hist.empty: continue
             
             # 1. Earnings Logic
             if symbol in DATES_2026:
-                days_to_earn = (DATES_2026[symbol] - datetime.now()).days
-            else:
-                days_to_earn = 99 
-                cal = t.get_calendar()
-                if cal is not None and not cal.empty:
-                    d = pd.to_datetime(cal.iloc[0, 0]).replace(tzinfo=None)
-                    days_to_earn = (d - datetime.now()).days
-
-            if days_to_earn < earn_buffer:
-                continue # STRICT SKIP for your 10-day safety rule
-
-            # 2. Quality & Liquidity Metrics
-            price = hist['Close'].iloc[-1]
-            sma_50 = hist['Close'].rolling(50).mean().iloc[-1]
-            avg_vol = hist['Volume'].tail(10).mean() # Liquidity proxy
-            
-            # 3. Options Selection
-            if not t.options: continue
-            expiry = t.options[0]
-            for e in t.options:
-                diff = (datetime.strptime(e, "%Y-%m-%d") - datetime.now()).days
-                if 7 <= diff <= 15:
-                    expiry = e
-                    break
-            
-            chain = t.option_chain(expiry)
-            puts = chain.puts
-            
-            # Select Strike (Quality OTM Target)
-            target_strike = price * (1 - (otm_target / 100))
-            idx = (puts['strike'] - target_strike).abs().idxmin()
-            opt = puts.loc[idx]
-            
-            # Handle Pre-market / Weekend Bid-Ask spreads
-            premium = (opt['bid'] + opt['ask']) / 2 if (opt['bid'] + opt['ask']) > 0 else opt['lastPrice']
-            if premium < 0.15: continue
-            
-            # 4. SCORING MODEL (Prioritizing Volatility + Quality)
-            weekly_yield = (premium / opt['strike']) * 100
-            annual_yield = weekly_yield * 52
-            
-            if annual_yield < min_annual: continue
-            
-            # Score: Yield intensity + Distance from 50MA (Rewards consolidation)
-            dist_sma_pct = ((price/sma_50 - 1) * 100)
-            score = (annual_yield * 0.7) - (abs(dist_sma_pct) * 2)
-            
-            results.append({
-                "Ticker": symbol,
-                "Score": round(score, 1),
-                "Annual %": f"{round(annual_yield, 1)}%",
-                "Premium": f"${round(premium, 2)}",
-                "Strike": opt['strike'],
-                "Price": round(price, 2),
-                "Earn In": f"{days_to_earn}d",
-                "Liquidity (M)": f"{round(avg_vol / 1e6, 1
