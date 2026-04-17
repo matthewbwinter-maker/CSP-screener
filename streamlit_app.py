@@ -6,8 +6,8 @@ import numpy as np
 st.set_page_config(page_title="Premium Hunter", layout="wide")
 st.title("💰 Weekly CSP Premium Hunter")
 
-# Tickers known for high options liquidity and "juice"
-TICKERS = ['TSLA', 'NVDA', 'AMD', 'AAPL', 'AMZN', 'GOOGL', 'NFLX', 'META', 'COIN', 'MARA']
+# Expanded list to ensure we find "Juice"
+TICKERS = ['TSLA', 'NVDA', 'AMD', 'AAPL', 'AMZN', 'GOOGL', 'NFLX', 'META', 'COIN', 'MARA', 'MSTR', 'RIVN', 'BABA']
 
 def get_rsi(series, period=14):
     delta = series.diff()
@@ -21,7 +21,7 @@ if st.button("🔥 Scan for Juice"):
     status = st.empty()
     
     for symbol in TICKERS:
-        status.text(f"Calculating yield for {symbol}...")
+        status.text(f"Scanning {symbol}...")
         try:
             t = yf.Ticker(symbol)
             hist = t.history(period="1y")
@@ -31,38 +31,46 @@ if st.button("🔥 Scan for Juice"):
             exp = t.options[0]
             chain = t.option_chain(exp)
             
-            # We look at the Put closest to 5% Out-of-the-Money (OTM)
+            # Find the ~5% OTM Put
             current_price = hist['Close'].iloc[-1]
             target_strike = current_price * 0.95
-            
-            # Find the actual strike in the chain closest to our target
             idx = (chain.puts['strike'] - target_strike).abs().idxmin()
             put_option = chain.puts.loc[idx]
             
-            # --- CALCULATIONS ---
+            # --- METRICS ---
             iv_val = put_option['impliedVolatility'] * 100
             premium = (put_option['bid'] + put_option['ask']) / 2
-            # Weekly Yield = Premium / Strike Price
             weekly_yield = (premium / put_option['strike']) * 100
-            
             rsi = get_rsi(hist['Close']).iloc[-1]
             total_oi = chain.puts['openInterest'].sum()
 
-            # --- THE SCOREBOARD ---
+            # --- GRANULAR SCORING ---
             score = 0
-            if iv_val > 30: score += 40      # Volatility is King
-            if weekly_yield > 1.0: score += 20 # >1% per week is the goal
-            if total_oi > 1000: score += 20   # Liquidity
-            if 30 < rsi < 50: score += 20     # Technical Entry
+            # Volatility (Max 40)
+            if iv_val > 45: score += 40
+            elif iv_val > 30: score += 30
+            elif iv_val > 20: score += 15
+            
+            # Yield (Max 20)
+            if weekly_yield > 1.5: score += 20
+            elif weekly_yield > 0.8: score += 10
+            
+            # RSI (Max 20)
+            if 30 < rsi < 50: score += 20
+            elif 50 <= rsi < 60: score += 10
+            
+            # Liquidity (Max 20)
+            if total_oi > 2000: score += 20
+            elif total_oi > 500: score += 10
             
             results.append({
                 "Ticker": symbol,
                 "Score": score,
-                "Weekly Yield %": round(weekly_yield, 2),
+                "Weekly %": round(weekly_yield, 2),
                 "IV %": round(iv_val, 1),
                 "RSI": round(rsi, 1),
                 "Strike": put_option['strike'],
-                "Premium $": round(premium, 2),
+                "Premium": round(premium, 2),
                 "Open Int": int(total_oi)
             })
         except:
@@ -73,6 +81,5 @@ if st.button("🔥 Scan for Juice"):
     if results:
         df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
         st.dataframe(df, use_container_width=True)
-        st.write("*(Weekly Yield assumes selling a 5% Out-of-the-Money Put)*")
     else:
-        st.error("Markets might be closed or API is throttled. Try again in 1 minute.")
+        st.error("No data returned. Try again.")
