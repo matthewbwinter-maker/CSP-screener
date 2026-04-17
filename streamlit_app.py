@@ -13,23 +13,22 @@ st.set_page_config(page_title="Act 60 Alpha Engine", layout="wide")
 st.markdown("""
 <style>
     .stApp { background-color: #050a14; color: #e0e6ed; }
-    h1, h2, h3 { font-family: 'Courier New', monospace; color: #00ffcc; }
-    .stMetric { background: #0d1b2a; border: 1px solid #1b263b; border-radius: 8px; padding: 10px; }
+    h1, h2, h3 { font-family: monospace; color: #00ffcc; }
+    .stTable { background-color: #0d1b2a; border-radius: 8px; }
     div.stButton > button {
-        background: #00ffcc; color: #050a14; font-weight: bold; border-radius: 4px; width: 100%;
+        background: #00ffcc; color: #050a14; font-weight: bold; width: 100%; border: none;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🛡️ Quality & Volatility Screener")
-st.caption("Focus: High Liquidity | > 10 Days to Earnings | Strategic Premium")
+st.caption("Strategic Focus: High Liquidity | > 10 Days to Earnings | Act 60 0% Capital Gains")
 
 # ──────────────────────────────────────────────
 # 2. CONFIGURATION
 # ──────────────────────────────────────────────
 with st.sidebar:
     st.header("Strategic Filters")
-    # Focused on your priorities: Quality + Volatility + Liquidity
     ticker_str = st.text_area("Ticker Universe", 
                              "NVDA, AMD, COIN, MSTR, AMZN, PLTR, HOOD, MARA, AAPL, DIS, CRM, SQ, SHOP, GOOGL")
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
@@ -47,14 +46,18 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
     progress = st.progress(0)
     status = st.empty()
     
-    # Static Dates for April/May 2026 to bypass '99-day' API glitches
-    # TSLA (4/22) and META (4/22) will be filtered out by your 10-day rule
+    # 2026 Earnings Calendar (Today is April 17)
     DATES_2026 = {
-        "TSLA": datetime(2026, 4, 22), "MSFT": datetime(2026, 4, 28),
-        "GOOGL": datetime(2026, 4, 29), "AMZN": datetime(2026, 4, 29),
-        "NVDA": datetime(2026, 5, 20), "AMD": datetime(2026, 4, 30),
-        "AAPL": datetime(2026, 5, 7), "COIN": datetime(2026, 5, 14),
-        "META": datetime(2026, 4, 22), "MSTR": datetime(2026, 5, 4)
+        "TSLA": datetime(2026, 4, 22), 
+        "META": datetime(2026, 4, 22),
+        "MSFT": datetime(2026, 4, 28),
+        "GOOGL": datetime(2026, 4, 29), 
+        "AMZN": datetime(2026, 4, 29),
+        "AMD": datetime(2026, 4, 30),
+        "MSTR": datetime(2026, 5, 4),
+        "AAPL": datetime(2026, 5, 7), 
+        "COIN": datetime(2026, 5, 14),
+        "NVDA": datetime(2026, 5, 20)
     }
 
     for i, symbol in enumerate(TICKERS):
@@ -64,7 +67,23 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
         try:
             t = yf.Ticker(symbol)
             hist = t.history(period="150d")
-            if hist.empty: continue
+            if hist.empty:
+                continue
             
             # 1. Earnings Logic
             if symbol in DATES_2026:
+                days_to_earn = (DATES_2026[symbol] - datetime.now()).days
+            else:
+                days_to_earn = 99 
+                cal = t.get_calendar()
+                if cal is not None and not cal.empty:
+                    d = pd.to_datetime(cal.iloc[0, 0]).replace(tzinfo=None)
+                    days_to_earn = (d - datetime.now()).days
+
+            # 2. Hard Block Safety Filter
+            if days_to_earn < earn_buffer:
+                continue 
+
+            # 3. Liquidity & Volatility Metrics
+            price = hist['Close'].iloc[-1]
+            sma_50 = hist['Close'].rolling
