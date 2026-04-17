@@ -6,50 +6,65 @@ from datetime import datetime
 import time
 
 # ──────────────────────────────────────────────
-# 1. CLEAN HIGH-CONTRAST THEME
+# 1. MAXIMUM CONTRAST THEME
 # ──────────────────────────────────────────────
 st.set_page_config(page_title="Weekly Exit Strategy", layout="wide")
 
-# High-contrast CSS focusing on sidebar visibility and button presence
 st.markdown("""
 <style>
-    /* Main Background */
+    /* Main App Background */
     .stApp { background-color: #000000; color: #FFFFFF; }
     
-    /* SIDEBAR: High Contrast White Text */
+    /* SIDEBAR: Pure White Bold Labels */
     section[data-testid="stSidebar"] {
-        background-color: #0a0a0a !important;
-        border-right: 1px solid #333333;
+        background-color: #050505 !important;
+        border-right: 1px solid #444444;
     }
     section[data-testid="stSidebar"] label p {
         color: #FFFFFF !important;
-        font-weight: 800 !important;
+        font-weight: 900 !important;
         font-size: 1.1rem !important;
+        text-transform: uppercase;
     }
     
-    /* SLIDERS: Make the value and track visible */
-    div[data-testid="stThumbValue"] { color: #00FF00 !important; font-weight: 900; }
-    div[data-baseweb="slider"] { background-color: #222222; }
+    /* SLIDERS: Neon Green Thumb & Value */
+    div[data-testid="stThumbValue"] { color: #00FF00 !important; font-weight: 900; font-size: 1.2rem; }
+    div[data-baseweb="slider"] { background-color: #333333; }
 
-    /* SEARCH BUTTON: Force visibility and Neon Green */
+    /* TABLE: Pure White Cells on Dark Background */
+    .stTable { background-color: #000000; border: 1px solid #444444; }
+    
+    /* Header Row: Neon Green with Black Text */
+    thead tr th { 
+        background-color: #00FF00 !important; 
+        color: #000000 !important; 
+        font-weight: 900 !important;
+    }
+    
+    /* Data Cells: FORCED PURE WHITE */
+    tbody tr td { 
+        color: #FFFFFF !important; 
+        font-weight: 700 !important; 
+        font-size: 1.05rem !important;
+        border-bottom: 1px solid #222222 !important;
+    }
+
+    /* SEARCH BUTTON: Giant Neon Green Trigger */
     div.stButton > button {
         background-color: #00FF00 !important;
         color: #000000 !important;
         font-weight: 900 !important;
         width: 100% !important;
-        border: 2px solid #00FF00 !important;
-        height: 4em !important;
+        border: none !important;
+        height: 4.5em !important;
         margin-top: 2em !important;
+        box-shadow: 0px 0px 15px #00FF00;
     }
-    
-    /* TABLE: High Contrast */
-    .stTable { background-color: #111111; border: 1px solid #444444; }
-    thead tr th { background-color: #00FF00 !important; color: #000000 !important; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🛡️ WEEKLY EXIT STRATEGY")
-st.markdown("### Focus: Analyst 'Buy' Ratings | High Probability | Weekly Only")
+st.markdown("### Analyst 'Buy' Filtered | High-Contrast Mode")
 
 # ──────────────────────────────────────────────
 # 2. SIDEBAR CONFIGURATION
@@ -62,18 +77,13 @@ with st.sidebar:
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
     
     st.divider()
-    
-    # OTM Safety slider (The green value above this should be easy to read now)
-    otm_target = st.slider("OTM Safety (%)", 3, 20, 7)
-    
-    # Days to earnings
-    earn_buffer = st.number_input("Min Days to Earnings", value=10)
+    otm_target = st.slider("OTM SAFETY (%)", 3, 20, 8)
+    earn_buffer = st.number_input("MIN DAYS TO EARNINGS", value=10)
 
 # ──────────────────────────────────────────────
 # 3. SCANNER LOGIC
 # ──────────────────────────────────────────────
-# The Search Button is now forced to the main page to ensure it's not hidden
-if st.button("🔍 RUN PROBABILITY SCAN"):
+if st.button("🚀 EXECUTE WEEKLY SEARCH"):
     results = []
     progress = st.progress(0)
     status = st.empty()
@@ -92,8 +102,10 @@ if st.button("🔍 RUN PROBABILITY SCAN"):
         
         try:
             t = yf.Ticker(symbol)
-            # Analyst Rating Check (Must be 'Buy' or 'Strong Buy')
-            rating = t.info.get('recommendationKey', 'none').replace('_', ' ').title()
+            # Filter for Analyst 'Buy' or 'Strong Buy'
+            info = t.info
+            rating = info.get('recommendationKey', 'none').replace('_', ' ').title()
+            
             if "Buy" not in rating:
                 continue
 
@@ -131,7 +143,7 @@ if st.button("🔍 RUN PROBABILITY SCAN"):
             
             prem = (opt['bid'] + opt['ask']) / 2 if (opt['bid'] + opt['ask']) > 0 else opt['lastPrice']
             
-            # Scoring (Safety Priority)
+            # Final Score
             score = 50 + (otm_target * 2.5)
             if rating == "Strong Buy": score += 15
             
@@ -142,7 +154,7 @@ if st.button("🔍 RUN PROBABILITY SCAN"):
                 "Strike": opt['strike'],
                 "OTM %": f"{round(((price/opt['strike'])-1)*100, 1)}%",
                 "Premium": f"${round(prem, 2)}",
-                "Price": round(price, 2)
+                "Price": f"${round(price, 2)}"
             })
             time.sleep(0.1)
         except:
@@ -153,7 +165,8 @@ if st.button("🔍 RUN PROBABILITY SCAN"):
 
     if results:
         df = pd.DataFrame(results).sort_values("Score", ascending=False)
-        st.subheader("🟢 TOP WEEKLY TRADES")
+        st.subheader("📊 QUANTIFIED OPPORTUNITIES")
+        # st.table is best for forced contrast over st.dataframe
         st.table(df)
     else:
-        st.error("No 'Buy' rated stocks met the safety criteria. Try lowering 'OTM Safety'.")
+        st.error("No trades matched your Analyst Buy / Safety criteria.")
