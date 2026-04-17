@@ -2,76 +2,38 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 
 # ──────────────────────────────────────────────
 # 1. MAXIMUM CONTRAST THEME
 # ──────────────────────────────────────────────
-st.set_page_config(page_title="Weekly Exit Strategy", layout="wide")
+st.set_page_config(page_title="Next-Week Weeklys", layout="wide")
 
 st.markdown("""
 <style>
-    /* Main App Background */
     .stApp { background-color: #000000; color: #FFFFFF; }
-    
-    /* SIDEBAR: Pure White Bold Labels */
-    section[data-testid="stSidebar"] {
-        background-color: #050505 !important;
-        border-right: 1px solid #444444;
-    }
-    section[data-testid="stSidebar"] label p {
-        color: #FFFFFF !important;
-        font-weight: 900 !important;
-        font-size: 1.1rem !important;
-        text-transform: uppercase;
-    }
-    
-    /* SLIDERS: Neon Green Thumb & Value */
-    div[data-testid="stThumbValue"] { color: #00FF00 !important; font-weight: 900; font-size: 1.2rem; }
-    div[data-baseweb="slider"] { background-color: #333333; }
-
-    /* TABLE: Pure White Cells on Dark Background */
+    section[data-testid="stSidebar"] { background-color: #050505 !important; border-right: 1px solid #444444; }
+    section[data-testid="stSidebar"] label p { color: #FFFFFF !important; font-weight: 900; font-size: 1.1rem; }
+    div[data-testid="stThumbValue"] { color: #00FF00 !important; font-weight: 900; }
     .stTable { background-color: #000000; border: 1px solid #444444; }
-    
-    /* Header Row: Neon Green with Black Text */
-    thead tr th { 
-        background-color: #00FF00 !important; 
-        color: #000000 !important; 
-        font-weight: 900 !important;
-    }
-    
-    /* Data Cells: FORCED PURE WHITE */
-    tbody tr td { 
-        color: #FFFFFF !important; 
-        font-weight: 700 !important; 
-        font-size: 1.05rem !important;
-        border-bottom: 1px solid #222222 !important;
-    }
-
-    /* SEARCH BUTTON: Giant Neon Green Trigger */
+    thead tr th { background-color: #00FF00 !important; color: #000000 !important; font-weight: 900; }
+    tbody tr td { color: #FFFFFF !important; font-weight: 700; font-size: 1.05rem; border-bottom: 1px solid #222222 !important; }
     div.stButton > button {
-        background-color: #00FF00 !important;
-        color: #000000 !important;
-        font-weight: 900 !important;
-        width: 100% !important;
-        border: none !important;
-        height: 4.5em !important;
-        margin-top: 2em !important;
-        box-shadow: 0px 0px 15px #00FF00;
+        background-color: #00FF00 !important; color: #000000 !important;
+        font-weight: 900 !important; width: 100% !important; height: 4.5em !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ WEEKLY EXIT STRATEGY")
-st.markdown("### Analyst 'Buy' Filtered | High-Contrast Mode")
+st.title("🛡️ NEXT-WEEK EXIT STRATEGY")
+st.markdown("### Exclusively Scanning: Friday, April 24, 2026")
 
 # ──────────────────────────────────────────────
-# 2. SIDEBAR CONFIGURATION
+# 2. SIDEBAR
 # ──────────────────────────────────────────────
 with st.sidebar:
     st.header("⚡ FILTERS")
-    
     ticker_str = st.text_area("Vetting Universe", 
                              "AAPL, MSFT, GOOGL, AMZN, NVDA, META, JPM, V, UNH, XOM, WMT, PG, AVGO, ORCL, COST, HD, ABBV")
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
@@ -83,18 +45,15 @@ with st.sidebar:
 # ──────────────────────────────────────────────
 # 3. SCANNER LOGIC
 # ──────────────────────────────────────────────
-if st.button("🚀 EXECUTE WEEKLY SEARCH"):
+if st.button("🚀 SCAN NEXT-WEEK CONTRACTS"):
     results = []
     progress = st.progress(0)
     status = st.empty()
     
-    # Static Dates for April/May 2026 Earnings
-    D_2026 = {
-        "TSLA": datetime(2026, 4, 22), "META": datetime(2026, 4, 22),
-        "MSFT": datetime(2026, 4, 28), "GOOGL": datetime(2026, 4, 29), 
-        "AMZN": datetime(2026, 4, 29), "AAPL": datetime(2026, 5, 7), 
-        "NVDA": datetime(2026, 5, 20), "AMD": datetime(2026, 4, 30)
-    }
+    # Target Expiry: Next Friday (April 24, 2026)
+    # Today is April 17, so we want 7 days from now.
+    today = datetime.now()
+    target_date_str = (today + timedelta(days=7)).strftime("%Y-%m-%d")
 
     for i, symbol in enumerate(TICKERS):
         progress.progress((i + 1) / len(TICKERS))
@@ -102,38 +61,45 @@ if st.button("🚀 EXECUTE WEEKLY SEARCH"):
         
         try:
             t = yf.Ticker(symbol)
-            # Filter for Analyst 'Buy' or 'Strong Buy'
+            
+            # Analyst Check
             info = t.info
             rating = info.get('recommendationKey', 'none').replace('_', ' ').title()
-            
-            if "Buy" not in rating:
-                continue
+            if "Buy" not in rating: continue
 
             # Earnings check
-            if symbol in D_2026:
-                days_to_earn = (D_2026[symbol] - datetime.now()).days
-            else:
-                days_to_earn = 99
+            cal = t.get_calendar()
+            days_to_earn = 99
+            if cal is not None and not cal.empty:
+                d_obj = pd.to_datetime(cal.iloc[0, 0]).replace(tzinfo=None)
+                days_to_earn = (d_obj - today).days
             
-            if days_to_earn < earn_buffer:
-                continue
+            if days_to_earn < earn_buffer: continue
 
             # Price Data
-            hist = t.history(period="200d")
+            hist = t.history(period="100d")
             price = hist['Close'].iloc[-1]
             
-            # Weekly Expiry (5-9 days out)
+            # ──────────────────────────────────────────────
+            # STRICT NEXT-WEEK FILTER
+            # ──────────────────────────────────────────────
             if not t.options: continue
-            target_exp = None
-            for e in t.options:
-                d_to_e = (datetime.strptime(e, "%Y-%m-%d") - datetime.now()).days
-                if 5 <= d_to_e <= 9:
-                    target_exp = e
-                    break
             
-            if not target_exp: continue 
+            # We specifically look for the April 24 expiry
+            if target_date_str not in t.options:
+                # If exact date isn't there, find the closest Friday between 6-9 days out
+                found_expiry = None
+                for e in t.options:
+                    diff = (datetime.strptime(e, "%Y-%m-%d") - today).days
+                    if 6 <= diff <= 9:
+                        found_expiry = e
+                        break
+                if not found_expiry: continue
+                expiry_to_use = found_expiry
+            else:
+                expiry_to_use = target_date_str
 
-            chain = t.option_chain(target_exp)
+            chain = t.option_chain(expiry_to_use)
             puts = chain.puts
             
             # Strike Selection
@@ -143,14 +109,10 @@ if st.button("🚀 EXECUTE WEEKLY SEARCH"):
             
             prem = (opt['bid'] + opt['ask']) / 2 if (opt['bid'] + opt['ask']) > 0 else opt['lastPrice']
             
-            # Final Score
-            score = 50 + (otm_target * 2.5)
-            if rating == "Strong Buy": score += 15
-            
             results.append({
                 "Ticker": symbol,
                 "Rating": rating,
-                "Score": round(score, 1),
+                "Expiry": expiry_to_use,
                 "Strike": opt['strike'],
                 "OTM %": f"{round(((price/opt['strike'])-1)*100, 1)}%",
                 "Premium": f"${round(prem, 2)}",
@@ -164,9 +126,8 @@ if st.button("🚀 EXECUTE WEEKLY SEARCH"):
     progress.empty()
 
     if results:
-        df = pd.DataFrame(results).sort_values("Score", ascending=False)
-        st.subheader("📊 QUANTIFIED OPPORTUNITIES")
-        # st.table is best for forced contrast over st.dataframe
+        df = pd.DataFrame(results).sort_values("Ticker")
+        st.subheader("📊 NEXT-WEEK OPPORTUNITIES")
         st.table(df)
     else:
-        st.error("No trades matched your Analyst Buy / Safety criteria.")
+        st.error(f"No next-week trades found for {target_date_str}. Check your filters.")
