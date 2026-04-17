@@ -2,13 +2,13 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 
 # ──────────────────────────────────────────────
-# 1. UI & STYLING
+# 1. UI SETUP
 # ──────────────────────────────────────────────
-st.set_page_config(page_title="Act 60 Alpha Engine", layout="wide")
+st.set_page_config(page_title="Act 60 Weekly Alpha", layout="wide")
 
 st.markdown("""
 <style>
@@ -17,37 +17,36 @@ st.markdown("""
     div.stButton > button {
         background: #00ffcc; color: #050a14; font-weight: bold; width: 100%; border: none; height: 3em;
     }
-    .stTable { background-color: #0d1b2a; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Quality & Volatility Screener")
-st.caption("Focus: High Liquidity | > 10 Days to Earnings | Strategic Act 60 Yield")
+st.title("🛡️ Weekly Quality Screener")
+st.caption("Targeting 5-8 Day Expiries | > 10 Days to Earnings | High Liquidity")
 
 # ──────────────────────────────────────────────
-# 2. CONFIGURATION
+# 2. SIDEBAR
 # ──────────────────────────────────────────────
 with st.sidebar:
-    st.header("Strategic Filters")
+    st.header("Parameters")
     ticker_str = st.text_area("Ticker Universe", 
                              "NVDA, AMD, COIN, MSTR, AMZN, PLTR, HOOD, MARA, AAPL, DIS, CRM, SQ, SHOP, GOOGL")
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
     
     st.divider()
     min_annual = st.slider("Min Annual Yield (%)", 15, 100, 25)
-    otm_target = st.slider("OTM Safety (%)", 5, 25, 10)
+    otm_safety = st.slider("OTM Safety (%)", 5, 25, 10)
     earn_buffer = st.number_input("Min Days to Earnings", value=10)
 
 # ──────────────────────────────────────────────
-# 3. ANALYSIS CORE
+# 3. ANALYSIS
 # ──────────────────────────────────────────────
-if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
+if st.button("🔍 SCAN FOR WEEKLY TRADES"):
     results = []
     progress = st.progress(0)
     status = st.empty()
     
-    # Static Dates for April/May 2026 cycle (Today is April 17, 2026)
-    DATES_2026 = {
+    # 2026 Earnings Map (Critical for the >10 day rule)
+    D_2026 = {
         "TSLA": datetime(2026, 4, 22), "META": datetime(2026, 4, 22),
         "MSFT": datetime(2026, 4, 28), "GOOGL": datetime(2026, 4, 29), 
         "AMZN": datetime(2026, 4, 29), "AMD": datetime(2026, 4, 30),
@@ -61,64 +60,60 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
         
         try:
             t = yf.Ticker(symbol)
-            hist = t.history(period="150d")
-            if hist.empty:
-                continue
+            hist = t.history(period="100d")
+            if hist.empty: continue
             
-            # 1. Earnings Logic
-            if symbol in DATES_2026:
-                days_to_earn = (DATES_2026[symbol] - datetime.now()).days
+            # 1. Earnings Check
+            if symbol in D_2026:
+                days_to_earn = (D_2026[symbol] - datetime.now()).days
             else:
-                days_to_earn = 99 
+                days_to_earn = 99
                 cal = t.get_calendar()
                 if cal is not None and not cal.empty:
-                    d = pd.to_datetime(cal.iloc[0, 0]).replace(tzinfo=None)
-                    days_to_earn = (d - datetime.now()).days
+                    d_obj = pd.to_datetime(cal.iloc[0, 0]).replace(tzinfo=None)
+                    days_to_earn = (d_obj - datetime.now()).days
 
-            # 2. Safety Filter (> 10 Days)
             if days_to_earn < earn_buffer:
                 continue 
 
-            # 3. Technicals & Liquidity
+            # 2. Quality & Price
             price = hist['Close'].iloc[-1]
             sma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
-            avg_vol_m = (hist['Volume'].tail(10).mean()) / 1e6
+            vol_m = (hist['Volume'].tail(10).mean()) / 1e6
             
-            # 4. Options Analysis
-            if not t.options:
-                continue
-                
-            # Filter for nearest weekly (7-15 days)
-            expiry = t.options[0]
+            # 3. STRICT WEEKLY EXPIRY LOGIC
+            if not t.options: continue
+            
+            # Find expiry between 5 and 10 days away
+            target_exp = None
             for e in t.options:
-                diff = (datetime.strptime(e, "%Y-%m-%d") - datetime.now()).days
-                if 7 <= diff <= 15:
-                    expiry = e
+                days_to_exp = (datetime.strptime(e, "%Y-%m-%d") - datetime.now()).days
+                if 5 <= days_to_exp <= 9: # This locks it to the next Friday
+                    target_exp = e
                     break
             
-            chain = t.option_chain(expiry)
+            if not target_exp: continue # Skip if no weekly available in that window
+            
+            chain = t.option_chain(target_exp)
             puts = chain.puts
             
-            # Strike Selection (OTM)
-            target_strike = price * (1 - (otm_target / 100))
-            idx = (puts['strike'] - target_strike).abs().idxmin()
+            # Strike Selection
+            strike_target = price * (1 - (otm_safety / 100))
+            idx = (puts['strike'] - strike_target).abs().idxmin()
             opt = puts.loc[idx]
             
-            # Premium
+            # Premium & Math
             prem = (opt['bid'] + opt['ask']) / 2 if (opt['bid'] + opt['ask']) > 0 else opt['lastPrice']
-            if prem < 0.10:
-                continue
+            if prem < 0.10: continue
             
-            # 5. Scoring Logic
             weekly_yield = (prem / opt['strike']) * 100
             annual_yield = weekly_yield * 52
             
-            if annual_yield < min_annual:
-                continue
+            if annual_yield < min_annual: continue
             
-            # Score: Favors high yield + Price stability (near SMA)
+            # Score (Yield + Liquidity + SMA proximity)
             dist_sma = ((price / sma_50) - 1) * 100
-            score = (annual_yield * 0.7) - (abs(dist_sma) * 2)
+            score = (annual_yield * 0.6) + (vol_m * 0.1) - (abs(dist_sma) * 1.5)
             
             results.append({
                 "Ticker": symbol,
@@ -126,9 +121,9 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
                 "Annual %": f"{round(annual_yield, 1)}%",
                 "Strike": opt['strike'],
                 "Premium": f"${round(prem, 2)}",
+                "Expiry": target_exp,
                 "Earn In": f"{days_to_earn}d",
-                "Liquidity": f"{round(avg_vol_m, 1)}M",
-                "Price": round(price, 2)
+                "Liquidity": f"{round(vol_m, 1)}M"
             })
             time.sleep(0.2)
             
@@ -140,10 +135,7 @@ if st.button("🔍 ANALYZE LIQUID OPPORTUNITIES"):
 
     if results:
         df = pd.DataFrame(results).sort_values("Score", ascending=False)
-        st.subheader("🏆 Ranked Alpha Opportunities")
+        st.subheader("🏆 Ranked Weekly Alpha")
         st.table(df)
-        
-        top = df.iloc[0]
-        st.success(f"Best Quality Pick: {top['Ticker']} at ${top['Strike']} strike (Score: {top['Score']})")
     else:
-        st.error(f"No results found. Try lowering your 'Min Annual Yield' or check 'Min Days to Earnings'.")
+        st.error("No weekly trades found. Try lowering OTM Safety or Annual Yield.")
