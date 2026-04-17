@@ -6,47 +6,45 @@ from datetime import datetime
 import time
 
 # ──────────────────────────────────────────────
-# 1. HIGH-CONTRAST "BLUE CHIP" UI
+# 1. HIGH-CONTRAST UI
 # ──────────────────────────────────────────────
-st.set_page_config(page_title="Blue Chip Alpha", layout="wide")
+st.set_page_config(page_title="Weekly Exit Pro", layout="wide")
 
 st.markdown("""
 <style>
     .stApp { background-color: #000000; color: #FFFFFF; }
     p, span, label, .stMarkdown { color: #FFFFFF !important; font-weight: 500; }
-    h1, h2, h3 { color: #00FF00 !important; font-family: 'Courier New', monospace; }
+    h1, h2, h3 { color: #00FF00 !important; font-family: monospace; }
     .stTable { background-color: #111111; border: 2px solid #333333; }
     thead tr th { background-color: #00FF00 !important; color: #000000 !important; }
     div.stButton > button {
         background-color: #00FF00; color: #000000; 
-        font-weight: 900; border: none; height: 3.5em; font-size: 1.2em;
+        font-weight: 900; border: none; height: 3.5em;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ BLUE CHIP WEEKLY SCANNER")
-st.caption("Lower Volatility | High Liquidity | Act 60 Strategic Yield")
+st.title("🛡️ WEEKLY EXIT STRATEGY")
+st.caption("Focus: Low Assignment Risk | Strong Buy Ratings | Weekly Expiry")
 
 # ──────────────────────────────────────────────
 # 2. CONFIGURATION
 # ──────────────────────────────────────────────
 with st.sidebar:
     st.header("⚡ FILTERS")
-    # Strictly Blue Chip Universe
-    ticker_str = st.text_area("Blue Chip List", 
-                             "AAPL, MSFT, GOOGL, AMZN, NVDA, META, JPM, V, UNH, XOM, WMT, PG, AVGO, ORCL, COST")
+    ticker_str = st.text_area("Blue Chip Universe", 
+                             "AAPL, MSFT, GOOGL, AMZN, NVDA, META, JPM, V, UNH, XOM, WMT, PG, AVGO, ORCL, COST, HD, ABBV")
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
     
     st.divider()
-    # Blue chips rarely offer 40%+ weekly; 15-25% is the 'Sweet Spot'
-    min_annual = st.slider("Min Annual Yield (%)", 10, 50, 15)
-    otm_safety = st.slider("OTM Safety (%)", 3, 15, 6)
+    # Focus on Safety (OTM) rather than Yield
+    otm_target = st.slider("OTM Safety (%)", 5, 20, 8)
     earn_buffer = st.number_input("Min Days to Earnings", value=10)
 
 # ──────────────────────────────────────────────
 # 3. ANALYSIS CORE
 # ──────────────────────────────────────────────
-if st.button("RUN BLUE CHIP SCAN"):
+if st.button("RUN PROBABILITY SCAN"):
     results = []
     progress = st.progress(0)
     status = st.empty()
@@ -56,20 +54,28 @@ if st.button("RUN BLUE CHIP SCAN"):
         "TSLA": datetime(2026, 4, 22), "META": datetime(2026, 4, 22),
         "MSFT": datetime(2026, 4, 28), "GOOGL": datetime(2026, 4, 29), 
         "AMZN": datetime(2026, 4, 29), "AAPL": datetime(2026, 5, 7), 
-        "NVDA": datetime(2026, 5, 20), "JPM": datetime(2026, 4, 15), # Past
-        "XOM": datetime(2026, 5, 1)
+        "NVDA": datetime(2026, 5, 20), "AMD": datetime(2026, 4, 30)
     }
 
     for i, symbol in enumerate(TICKERS):
         progress.progress((i + 1) / len(TICKERS))
-        status.markdown(f"**Analyzing:** `{symbol}`")
+        status.markdown(f"**Vetting:** `{symbol}`")
         
         try:
             t = yf.Ticker(symbol)
-            hist = t.history(period="150d")
+            hist = t.history(period="250d")
             if hist.empty: continue
             
-            # 1. Earnings Check
+            # 1. ANALYST RATING CHECK
+            # Pulling the 'recommendationKey' (e.g., 'buy', 'strong_buy')
+            info = t.info
+            rating = info.get('recommendationKey', 'none').replace('_', ' ').title()
+            
+            # Skip if analysts don't like it (We only want 'Buy' or 'Strong Buy')
+            if "Buy" not in rating:
+                continue
+
+            # 2. EARNINGS HARD-BLOCK
             if symbol in D_2026:
                 days_to_earn = (D_2026[symbol] - datetime.now()).days
             else:
@@ -82,17 +88,15 @@ if st.button("RUN BLUE CHIP SCAN"):
             if days_to_earn < earn_buffer:
                 continue 
 
-            # 2. Volatility (Beta) Check
-            # Using standard deviation of returns as a proxy for 'stickiness'
-            returns = hist['Close'].pct_change().dropna()
-            vol_profile = returns.std() * np.sqrt(252) # Annualized Vol
-            
-            # 3. Market Data
+            # 3. TECHNICAL "FLOOR" CHECK
             price = hist['Close'].iloc[-1]
-            sma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
-            vol_m = (hist['Volume'].tail(10).mean()) / 1e6
+            sma_200 = hist['Close'].rolling(window=200).mean().iloc[-1]
             
-            # 4. Weekly Options Search (5-9 days)
+            # Only trade if the stock is in a healthy long-term uptrend
+            if price < sma_200:
+                continue
+
+            # 4. WEEKLY OPTION SELECTION
             if not t.options: continue
             target_exp = None
             for e in t.options:
@@ -106,31 +110,28 @@ if st.button("RUN BLUE CHIP SCAN"):
             chain = t.option_chain(target_exp)
             puts = chain.puts
             
-            # 5. Strike Selection
-            strike_target = price * (1 - (otm_safety / 100))
+            # Strike Selection (Strategic OTM)
+            strike_target = price * (1 - (otm_target / 100))
             idx = (puts['strike'] - strike_target).abs().idxmin()
             opt = puts.loc[idx]
             
             prem = (opt['bid'] + opt['ask']) / 2 if (opt['bid'] + opt['ask']) > 0 else opt['lastPrice']
-            if prem < 0.10: continue
             
-            weekly_y = (prem / opt['strike']) * 100
-            annual_y = weekly_y * 52
-            
-            if annual_y < min_annual: continue
-            
-            # SCORING: Prefers Stability (Low Vol Profile) + Liquidity
-            score = (annual_y * 0.5) + (vol_m * 0.05) - (vol_profile * 10)
+            # 5. SCORING: Probability of Profit (POP) focused
+            # Rewards higher OTM distance and "Strong Buy" ratings
+            score = 50
+            score += (otm_target * 3) # Reward safety
+            if rating == "Strong Buy": score += 20
             
             results.append({
                 "Ticker": symbol,
+                "Rating": rating,
                 "Score": round(score, 1),
-                "Annual %": f"{round(annual_y, 1)}%",
                 "Strike": opt['strike'],
+                "OTM %": f"{round(((price/opt['strike'])-1)*100, 1)}%",
                 "Premium": f"${round(prem, 2)}",
                 "Earn In": f"{days_to_earn}d",
-                "Liquidity": f"{round(vol_m, 1)}M",
-                "Volatility": "Low" if vol_profile < 0.25 else "Moderate"
+                "Price": round(price, 2)
             })
             time.sleep(0.2)
             
@@ -142,7 +143,7 @@ if st.button("RUN BLUE CHIP SCAN"):
 
     if results:
         df = pd.DataFrame(results).sort_values("Score", ascending=False)
-        st.subheader("🏆 RANKED BLUE CHIP OPPORTUNITIES")
+        st.subheader("🏆 TOP PROBABILITY TRADES")
         st.table(df)
     else:
-        st.error("No Blue Chips found. Try lowering the 'OTM Safety' or 'Annual Yield'.")
+        st.error("No 'Buy' rated stocks met the safety criteria. Try lowering 'OTM Safety'.")
