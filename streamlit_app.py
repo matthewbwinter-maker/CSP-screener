@@ -1,68 +1,85 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+from datetime import datetime, timedelta
 import time
 
-# 1. UI SETUP
-st.set_page_config(page_title="Deep Search Exit", layout="wide")
+# ──────────────────────────────────────────────
+# 1. MOBILE-OPTIMIZED HIGH CONTRAST UI
+# ──────────────────────────────────────────────
+st.set_page_config(page_title="Exit Strategy", layout="wide")
+
 st.markdown("""
 <style>
     .stApp { background-color: #000000; color: #FFFFFF; }
-    [data-testid="stSidebar"] { background-color: #050505 !important; border-right: 1px solid #444444; }
-    [data-testid="stSidebar"] label p { color: #FFFFFF !important; font-weight: 900; }
+    [data-testid="stSidebar"] { background-color: #080808 !important; border-right: 1px solid #333333; }
+    [data-testid="stSidebar"] label p { color: #FFFFFF !important; font-weight: 900; font-size: 1.1rem; }
+    div[data-testid="stThumbValue"] { color: #00FF00 !important; font-weight: 900; }
+    
+    /* TABLE: Pure White Bold Cells for Phone Visibility */
     thead tr th { background-color: #00FF00 !important; color: #000000 !important; font-weight: 900; }
-    tbody tr td { color: #FFFFFF !important; font-weight: 700; border-bottom: 1px solid #222222 !important; }
-    div.stButton > button { background-color: #00FF00 !important; color: #000000 !important; font-weight: 900 !important; height: 4em !important; }
+    tbody tr td { color: #FFFFFF !important; font-weight: 800 !important; font-size: 1.1rem !important; }
+    
+    /* BIG GREEN BUTTON FOR MOBILE THUMBS */
+    div.stButton > button {
+        background-color: #00FF00 !important; color: #000000 !important;
+        font-weight: 900 !important; width: 100% !important; height: 5em !important;
+        border-radius: 10px; border: none;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ DEEP SEARCH: APRIL 24")
+st.title("🛡️ WEEKLY EXIT STRATEGY")
 
+# ──────────────────────────────────────────────
 # 2. SIDEBAR
+# ──────────────────────────────────────────────
 with st.sidebar:
     st.header("⚡ FILTERS")
-    # Small, high-liquidity list to avoid API timeout
-    ticker_str = st.text_area("Vetting Universe", "NVDA, AAPL, MSFT, AMZN, META, AVGO, JPM, UNH, COST")
+    ticker_str = st.text_area("Universe", "NVDA, AAPL, MSFT, AMZN, META, AVGO, JPM, UNH, COST")
     TICKERS = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
     
     st.divider()
-    # AGGRESSIVE: If no hits, drop OTM to 3% to verify data is flowing
-    otm_target = st.slider("OTM SAFETY (%)", 1, 20, 5)
-    # FORCE 0: Set this to 0 to bypass the earnings block during this busy week
-    earn_buffer = st.number_input("MIN DAYS TO EARNINGS", value=0)
+    otm_target = st.slider("OTM SAFETY (%)", 3, 20, 8)
+    earn_buffer = st.number_input("MIN DAYS TO EARNINGS", value=7)
     
-    target_date = st.text_input("Force Expiry Date", value="2026-04-24")
+    st.divider()
+    target_date = st.text_input("Target Friday", value="2026-04-24")
 
-# 3. SCANNER LOGIC
-if st.button("🚀 FORCE DEEP SCAN"):
+# ──────────────────────────────────────────────
+# 3. SCANNER
+# ──────────────────────────────────────────────
+if st.button("🚀 RUN NEXT-WEEK SCAN"):
     results = []
-    debug_log = []
     progress = st.progress(0)
+    today = datetime.now()
 
     for i, symbol in enumerate(TICKERS):
         progress.progress((i + 1) / len(TICKERS))
         try:
             t = yf.Ticker(symbol)
             
-            # Check if expiry exists in the API's list
-            if target_date not in t.options:
-                debug_log.append(f"❌ {symbol}: {target_date} not in options list. Available: {t.options[:3]}")
-                continue
+            # Check Analyst Rating
+            info = t.info
+            rating = info.get('recommendationKey', 'none').replace('_', ' ').title()
+            if "Buy" not in rating: continue
 
-            # Skip Analysts for the deep scan to ensure we get results
+            # Check Earnings (Skip if too close)
+            cal = t.get_calendar()
+            if cal is not None and not cal.empty:
+                try:
+                    earn_date = pd.to_datetime(cal.iloc[0, 0]).replace(tzinfo=None)
+                    if (earn_date - today).days < earn_buffer: continue
+                except: pass
+
+            # Fetch Price and Chain
             hist = t.history(period="1d")
-            if hist.empty: continue
             price = hist['Close'].iloc[-1]
             
-            # Pull the Chain
             chain = t.option_chain(target_date)
             puts = chain.puts
             
-            if puts.empty:
-                debug_log.append(f"⚠️ {symbol}: Put chain returned empty for {target_date}")
-                continue
-
-            # Select Strike
+            # Find Strike
             strike_goal = price * (1 - (otm_target / 100))
             idx = (puts['strike'] - strike_goal).abs().idxmin()
             opt = puts.loc[idx]
@@ -71,24 +88,17 @@ if st.button("🚀 FORCE DEEP SCAN"):
             
             results.append({
                 "Ticker": symbol,
+                "Rating": rating,
                 "Strike": opt['strike'],
                 "OTM %": f"{round(((price/opt['strike'])-1)*100, 1)}%",
                 "Premium": f"${round(prem, 2)}",
                 "Price": f"${round(price, 2)}"
             })
-            debug_log.append(f"✅ {symbol}: Found strike {opt['strike']}")
             time.sleep(0.1)
-        except Exception as e:
-            debug_log.append(f"🚨 {symbol}: Error -> {str(e)}")
-            continue
+        except: continue
 
     progress.empty()
-
     if results:
-        st.subheader("🟢 RESULTS")
-        st.table(pd.DataFrame(results))
-    
-    # DEBUG DRAWER: This tells us WHY it's failing
-    with st.expander("🔍 API DEBUG LOG (Click to see why it's failing)"):
-        for line in debug_log:
-            st.text(line)
+        st.table(pd.DataFrame(results).sort_values("Ticker"))
+    else:
+        st.error("No hits. Ensure the 'Target Friday' matches TOS exactly.")
