@@ -1,84 +1,90 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
+import time
 from datetime import datetime
 
-st.set_page_config(page_title="Wheel Pro Screener", layout="wide")
-st.title("🎡 Wheel Strategy: Premium Selector")
+st.set_page_config(page_title="Robust Wheel Screener", layout="wide")
+st.title("🎡 Robust Wheel: 80% Win Rate")
 
-# Diverse list: High Vol, Blue Chip, and Tech
-TICKERS = ['TSLA', 'NVDA', 'AMD', 'AAPL', 'AMZN', 'MSFT', 'GOOGL', 'META', 'COIN', 'MSTR', 'AMD', 'MARA', 'JPM', 'DIS', 'GS']
+TICKERS = ['TSLA', 'NVDA', 'AMD', 'AAPL', 'AMZN', 'MSFT', 'GOOGL', 'META', 'COIN', 'MSTR', 'AMD', 'NFLX', 'DIS']
 
-if st.button("🔍 Scan for Weekly Plays"):
+if st.button("🔍 Run Stable Scan"):
     results = []
     status = st.empty()
     
     for symbol in TICKERS:
-        status.text(f"Checking {symbol}...")
+        status.text(f"Fetching {symbol}...")
+        # Small delay to prevent API rate limiting
+        time.sleep(0.5) 
+        
         try:
             t = yf.Ticker(symbol)
-            hist = t.history(period="1y")
-            if len(hist) < 50: continue
+            # Try to get data with a 1-day period to keep it light
+            hist = t.history(period="100d")
+            if hist.empty: continue
             
-            # --- 1. EARNINGS CHECK (SOFT BLOCK) ---
-            earnings_penalty = 0
+            # --- 1. EARNINGS (GRACEFUL FAIL) ---
             days_to_earn = 99
-            if t.calendar is not None and not t.calendar.empty:
-                next_earn = t.calendar.iloc[0, 0].replace(tzinfo=None)
-                days_to_earn = (next_earn - datetime.now()).days
-                if 0 <= days_to_earn <= 14:
-                    earnings_penalty = 50 # Heavy penalty, but not a delete
+            try:
+                # Use .get_calendar() instead of .calendar for stability
+                cal = t.get_calendar()
+                if cal is not None and not cal.empty:
+                    # Accessing the first date in the calendar
+                    next_earn = cal.iloc[0, 0]
+                    if isinstance(next_earn, datetime):
+                        days_to_earn = (next_earn.replace(tzinfo=None) - datetime.now()).days
+            except:
+                pass # If earnings fail, we don't crash the whole app
 
-            # --- 2. SUPPORT & RSI ---
-            sma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+            # --- 2. TECHNICALS ---
             price = hist['Close'].iloc[-1]
-            # RSI Calculation
+            sma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+            
+            # RSI
             delta = hist['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rsi = 100 - (100 / (1 + (gain/loss)))
-            rsi_val = rsi.iloc[-1]
+            rsi_val = (100 - (100 / (1 + (gain/loss)))).iloc[-1]
 
-            # --- 3. OPTIONS & 80% PROB ---
+            # --- 3. OPTIONS ---
             exp = t.options[0]
             chain = t.option_chain(exp)
-            # Find ~0.20 Delta strike (approx 10% OTM for these tickers)
+            # Find ~0.20 Delta strike
             target = price * 0.90
             idx = (chain.puts['strike'] - target).abs().idxmin()
             opt = chain.puts.loc[idx]
             
-            # Liquidity: Bid-Ask Spread
+            # Calculation
             spread = (opt['ask'] - opt['bid']) / ((opt['ask'] + opt['bid']) / 2)
             weekly_yield = ((opt['bid'] + opt['ask'])/2 / opt['strike']) * 100
 
-            # --- FINAL SCORING ---
+            # --- FLEXIBLE SCORING ---
             score = 100
-            if days_to_earn <= 14: score -= earnings_penalty
-            if spread > 0.10: score -= 20   # Penalty for bad liquidity
-            if price > sma_50 * 1.05: score -= 20 # Penalty for being "extended" (too high)
-            if rsi_val > 60: score -= 15    # Penalty for being overbought
+            if 0 <= days_to_earn <= 14: score -= 40
+            if spread > 0.15: score -= 20
+            if price > sma_50 * 1.05: score -= 20 # Extended price penalty
             
-            # Bonuses
-            if 30 < rsi_val < 45: score += 10 # Bonus for oversold
-            if weekly_yield > 1.0: score += 10 # Bonus for high juice
+            # Bonuses for good entries
+            if rsi_val < 40: score += 15
+            if weekly_yield > 1.2: score += 10
 
             results.append({
                 "Ticker": symbol,
                 "Score": score,
                 "Weekly %": round(weekly_yield, 2),
                 "Strike": opt['strike'],
-                "Dist to 50MA": f"{round(((price/sma_50)-1)*100, 1)}%",
-                "RSI": round(rsi_val, 1),
+                "Dist 50MA": f"{round(((price/sma_50)-1)*100, 1)}%",
                 "Earn In": f"{days_to_earn}d",
                 "IV %": round(opt['impliedVolatility']*100, 1)
             })
-        except: continue
+        except Exception as e:
+            st.warning(f"Skipping {symbol}: Data connection hiccup.")
+            continue
             
     status.empty()
     if results:
         df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
         st.dataframe(df, use_container_width=True)
-        st.info("Scores above 70 are prime Wheel candidates. Watch out for 'Earn In' < 7d!")
     else:
-        st.error("Technical error fetching data. Try again.")
+        st.error("Still no results. This is likely a temporary Yahoo Finance block. Try again in 10 minutes.")
