@@ -6,41 +6,12 @@ import streamlit as st
 import yfinance as yf
 
 
-# ---------------------------------
-# PAGE / STYLE
-# ---------------------------------
 st.set_page_config(page_title="CSP Opportunity Screener", layout="wide")
-
-st.markdown("""
-<style>
-    .stApp { background-color: #000000; color: #FFFFFF; }
-    [data-testid="stMetricValue"] { color: #00FF00 !important; font-size: 1.7rem !important; }
-    thead tr th {
-        background-color: #00FF00 !important;
-        color: #000000 !important;
-        font-weight: 900 !important;
-    }
-    tbody tr td {
-        color: #FFFFFF !important;
-        font-weight: 700 !important;
-        font-size: 1rem !important;
-    }
-    div.stButton > button {
-        background-color: #00FF00 !important;
-        color: #000000 !important;
-        font-weight: 900 !important;
-        width: 100% !important;
-        height: 3.3em !important;
-    }
-</style>
-""", unsafe_allow_html=True)
-
 st.title("🏆 CSP Opportunity Screener")
 
-
-# ---------------------------------
-# HELPERS
-# ---------------------------------
+# ----------------------------
+# Helpers
+# ----------------------------
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -54,6 +25,8 @@ def safe_float(x, default=0.0):
 
 def min_max_scale(series: pd.Series) -> pd.Series:
     s = series.astype(float)
+    if len(s) == 0:
+        return s
     lo, hi = s.min(), s.max()
     if pd.isna(lo) or pd.isna(hi) or hi - lo == 0:
         return pd.Series([0.5] * len(series), index=series.index)
@@ -63,9 +36,8 @@ def estimate_put_delta(spot: float, strike: float, dte: int, iv: float, r: float
     if spot <= 0 or strike <= 0 or dte <= 0 or iv <= 0:
         return float("nan")
     T = dte / 365.0
-    sigma = iv
     try:
-        d1 = (math.log(spot / strike) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d1 = (math.log(spot / strike) + (r + 0.5 * iv**2) * T) / (iv * math.sqrt(T))
         return norm_cdf(d1) - 1.0
     except Exception:
         return float("nan")
@@ -89,48 +61,42 @@ def premium_label(roc: float, annualized_roc: float) -> str:
     return "Too Thin"
 
 
-# ---------------------------------
-# DATA FETCH
-# ---------------------------------
+# ----------------------------
+# Data Fetch
+# ----------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_last_prices_and_stats(tickers):
-    data = yf.download(
-        tickers=tickers,
-        period="3mo",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-
     rows = []
-
-    if len(tickers) == 1:
-        t = tickers[0]
-        df = data.copy()
-        close = df["Close"].dropna()
-        if len(close) >= 25:
-            spot = float(close.iloc[-1])
-            ret_5d = spot / float(close.iloc[-6]) - 1 if len(close) >= 6 else float("nan")
-            hv20 = close.pct_change().dropna().tail(20).std() * math.sqrt(252)
-            rows.append({
-                "Ticker": t,
-                "Spot": round(spot, 2),
-                "Ret5D": ret_5d,
-                "HV20": hv20,
-            })
-        return pd.DataFrame(rows)
 
     for t in tickers:
         try:
-            df = data[t].copy()
-            close = df["Close"].dropna()
+            hist = yf.download(
+                t,
+                period="3mo",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
+            if hist is None or hist.empty:
+                continue
+
+            # Flatten in case yfinance returns multiindex columns
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = hist.columns.get_level_values(0)
+
+            if "Close" not in hist.columns:
+                continue
+
+            close = hist["Close"].dropna()
             if len(close) < 25:
                 continue
+
             spot = float(close.iloc[-1])
-            ret_5d = spot / float(close.iloc[-6]) - 1 if len(close) >= 6 else float("nan")
+            ret_5d = (spot / float(close.iloc[-6]) - 1.0) if len(close) >= 6 else float("nan")
             hv20 = close.pct_change().dropna().tail(20).std() * math.sqrt(252)
+
             rows.append({
                 "Ticker": t,
                 "Spot": round(spot, 2),
@@ -142,10 +108,11 @@ def fetch_last_prices_and_stats(tickers):
 
     return pd.DataFrame(rows)
 
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_expirations(symbol: str):
     tk = yf.Ticker(symbol)
-    return tk.options
+    return list(tk.options)
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_option_chain(symbol: str, expiry: str):
@@ -153,35 +120,26 @@ def fetch_option_chain(symbol: str, expiry: str):
     return tk.option_chain(expiry)
 
 
-# ---------------------------------
-# UNDERLYING RANKING
-# ---------------------------------
+# ----------------------------
+# Ranking
+# ----------------------------
 def rank_underlyings(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
-    # Prefer names with decent realized vol and some recent pullback
-    out["DownMoveScore"] = -out["Ret5D"]
+    out["DownMoveScore"] = -out["Ret5D"].fillna(0)
     out["UnderlyingScore"] = (
         0.55 * min_max_scale(out["HV20"].fillna(0)) +
         0.45 * min_max_scale(out["DownMoveScore"].fillna(0))
     )
-
     out = out.sort_values("UnderlyingScore", ascending=False).reset_index(drop=True)
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
 
-
-# ---------------------------------
-# OPTION SCORING
-# ---------------------------------
 def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> pd.DataFrame:
     if puts.empty:
         return pd.DataFrame()
 
     expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-    today = date.today()
-    dte = (expiry_date - today).days
-
+    dte = (expiry_date - date.today()).days
     if dte <= 0:
         return pd.DataFrame()
 
@@ -247,7 +205,6 @@ def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> 
 
     return pd.DataFrame(rows)
 
-
 def filter_and_rank_puts(
     df: pd.DataFrame,
     min_otm_pct: float,
@@ -303,21 +260,15 @@ def filter_and_rank_puts(
     return ranked
 
 
-# ---------------------------------
-# SIDEBAR
-# ---------------------------------
+# ----------------------------
+# Sidebar
+# ----------------------------
 with st.sidebar:
-    st.header("Universe")
-
     ticker_str = st.text_area(
         "Tickers",
         "NVDA, AAPL, MSFT, AMZN, META, AVGO, JPM, UNH, COST"
     )
     tickers = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
-
-    st.caption("Yahoo-safe flow: rank names first, then fetch one option chain.")
-
-    st.header("Put Filters")
 
     min_otm_pct = st.slider("Min OTM %", 0.0, 20.0, 5.0, 0.5) / 100.0
     min_be_buffer_pct = st.slider("Min Break-even Buffer %", 0.0, 20.0, 6.0, 0.5) / 100.0
@@ -328,101 +279,83 @@ with st.sidebar:
     min_oi = st.number_input("Min Open Interest", min_value=0, value=300, step=50)
     min_volume = st.number_input("Min Volume", min_value=0, value=1, step=1)
     min_mid = st.number_input("Min Premium ($)", min_value=0.0, value=0.35, step=0.05, format="%.2f")
-
-    st.header("Premium Floors")
-
     min_roc = st.slider("Min ROC %", 0.0, 2.0, 0.40, 0.05) / 100.0
     min_annualized_roc = st.slider("Min Annualized ROC %", 0.0, 100.0, 20.0, 1.0) / 100.0
-
     exclude_too_thin = st.checkbox("Exclude 'Too Thin' premium", value=True)
-
-    st.header("Model")
-    rf_rate = st.number_input(
-        "Risk-free Rate",
-        min_value=0.0,
-        max_value=0.15,
-        value=0.04,
-        step=0.005,
-        format="%.3f"
-    )
+    rf_rate = st.number_input("Risk-free Rate", min_value=0.0, max_value=0.15, value=0.04, step=0.005, format="%.3f")
 
 
-# ---------------------------------
-# SESSION STATE
-# ---------------------------------
+# ----------------------------
+# Session State
+# ----------------------------
 if "underlying_rank" not in st.session_state:
     st.session_state["underlying_rank"] = None
-
 if "scan_error" not in st.session_state:
     st.session_state["scan_error"] = None
 
 
-# ---------------------------------
-# STEP 1: RANK UNDERLYINGS
-# ---------------------------------
-if st.button("1) Rank Underlyings"):
-    try:
-        raw = fetch_last_prices_and_stats(tickers)
-        if raw.empty:
+# ----------------------------
+# Step 1
+# ----------------------------
+if st.button("1) Rank Underlyings", type="primary"):
+    with st.spinner("Ranking underlyings..."):
+        try:
+            raw = fetch_last_prices_and_stats(tickers)
+
+            if raw.empty:
+                st.session_state["underlying_rank"] = None
+                st.session_state["scan_error"] = (
+                    "No price data returned. Yahoo likely blocked requests or one of the symbols failed."
+                )
+            else:
+                ranked_names = rank_underlyings(raw)
+                st.session_state["underlying_rank"] = ranked_names
+                st.session_state["scan_error"] = None
+
+        except Exception as e:
             st.session_state["underlying_rank"] = None
-            st.session_state["scan_error"] = "No price data returned."
-        else:
-            ranked_names = rank_underlyings(raw)
-            st.session_state["underlying_rank"] = ranked_names
-            st.session_state["scan_error"] = None
-    except Exception as e:
-        st.session_state["underlying_rank"] = None
-        st.session_state["scan_error"] = f"Price ranking failed: {e}"
+            st.session_state["scan_error"] = f"Price ranking failed: {e}"
 
 if st.session_state["scan_error"]:
     st.error(st.session_state["scan_error"])
 
 
-# ---------------------------------
-# SHOW UNDERLYING SHORTLIST
-# ---------------------------------
+# ----------------------------
+# Step 2 / 3
+# ----------------------------
 underlying_rank = st.session_state["underlying_rank"]
 
 if underlying_rank is not None and not underlying_rank.empty:
-    st.subheader("Underlying shortlist")
+    st.success(f"Loaded {len(underlying_rank)} underlyings.")
 
-    shortlist_display = underlying_rank.copy()
-    shortlist_display["Ret5D"] = (shortlist_display["Ret5D"] * 100).round(2)
-    shortlist_display["HV20"] = (shortlist_display["HV20"] * 100).round(2)
-    shortlist_display["UnderlyingScore"] = shortlist_display["UnderlyingScore"].round(3)
+    show_df = underlying_rank.copy()
+    show_df["Ret5D"] = (show_df["Ret5D"] * 100).round(2)
+    show_df["HV20"] = (show_df["HV20"] * 100).round(2)
+    show_df["UnderlyingScore"] = show_df["UnderlyingScore"].round(3)
 
-    st.dataframe(shortlist_display, use_container_width=True, hide_index=True)
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
 
     top_names = underlying_rank["Ticker"].head(5).tolist()
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        selected_ticker = st.selectbox(
-            "2) Pick one ticker to inspect",
-            options=top_names,
-            index=0
-        )
+        selected_ticker = st.selectbox("2) Pick one ticker to inspect", options=top_names, index=0)
 
     with col2:
+        expirations = []
         try:
             expirations = fetch_expirations(selected_ticker)
         except Exception as e:
-            expirations = []
             st.warning(f"Could not fetch expirations for {selected_ticker}: {e}")
 
-        selected_expiry = st.selectbox(
-            "Expiry",
-            options=expirations if expirations else []
-        )
+        selected_expiry = st.selectbox("Expiry", options=expirations if expirations else [])
 
-    if selected_expiry:
-        if st.button("3) Fetch best put opportunities"):
+    if selected_expiry and st.button("3) Fetch best put opportunities"):
+        with st.spinner(f"Fetching {selected_ticker} options..."):
             try:
                 spot = float(
-                    underlying_rank.loc[
-                        underlying_rank["Ticker"] == selected_ticker, "Spot"
-                    ].iloc[0]
+                    underlying_rank.loc[underlying_rank["Ticker"] == selected_ticker, "Spot"].iloc[0]
                 )
 
                 chain = fetch_option_chain(selected_ticker, selected_expiry)
@@ -445,32 +378,20 @@ if underlying_rank is not None and not underlying_rank.empty:
                     exclude_too_thin=exclude_too_thin,
                 )
 
-                st.subheader(f"{selected_ticker} best put opportunities")
-
                 if ranked_puts.empty:
                     st.warning("No contracts passed your filters for this ticker/expiry.")
                 else:
                     top = ranked_puts.iloc[0]
-
-                    if top["Setup"] == "Pass":
-                        st.warning("No special trade here right now.")
-                    else:
-                        st.success(
-                            f"Top setup: {selected_ticker} {top['Strike']:.2f}P | "
-                            f"Mid ${top['Mid']:.2f} | Delta {top['DeltaEst']:.2f} | "
-                            f"Prob OTM {top['ProbOTMEst']:.0%} | "
-                            f"{top['PremiumLabel']} | {top['Setup']}"
-                        )
+                    st.success(
+                        f"Top setup: {selected_ticker} {top['Strike']:.2f}P | "
+                        f"Mid ${top['Mid']:.2f} | Delta {top['DeltaEst']:.2f} | "
+                        f"Prob OTM {top['ProbOTMEst']:.0%} | {top['PremiumLabel']} | {top['Setup']}"
+                    )
 
                     display = ranked_puts.copy()
-
                     pct_cols = [
-                        "OTM_Pct",
-                        "BE_Buffer_Pct",
-                        "ROC",
-                        "AnnualizedROC",
-                        "Spread_Pct",
-                        "ProbOTMEst",
+                        "OTM_Pct", "BE_Buffer_Pct", "ROC",
+                        "AnnualizedROC", "Spread_Pct", "ProbOTMEst"
                     ]
                     for col in pct_cols:
                         display[col] = (display[col] * 100).round(2)
@@ -482,28 +403,10 @@ if underlying_rank is not None and not underlying_rank.empty:
 
                     st.dataframe(
                         display[[
-                            "Rank",
-                            "Setup",
-                            "PremiumLabel",
-                            "Expiry",
-                            "DTE",
-                            "Spot",
-                            "Strike",
-                            "Bid",
-                            "Ask",
-                            "Mid",
-                            "DeltaEst",
-                            "ProbOTMEst",
-                            "OTM_Pct",
-                            "BE_Buffer_Pct",
-                            "ROC",
-                            "AnnualizedROC",
-                            "PremiumEfficiency",
-                            "Spread_Pct",
-                            "IV",
-                            "OpenInterest",
-                            "Volume",
-                            "Score",
+                            "Rank", "Setup", "PremiumLabel", "Expiry", "DTE", "Spot", "Strike",
+                            "Bid", "Ask", "Mid", "DeltaEst", "ProbOTMEst", "OTM_Pct",
+                            "BE_Buffer_Pct", "ROC", "AnnualizedROC", "PremiumEfficiency",
+                            "Spread_Pct", "IV", "OpenInterest", "Volume", "Score"
                         ]],
                         use_container_width=True,
                         hide_index=True
@@ -511,3 +414,5 @@ if underlying_rank is not None and not underlying_rank.empty:
 
             except Exception as e:
                 st.error(f"Option-chain fetch failed for {selected_ticker}: {e}")
+else:
+    st.info("Click '1) Rank Underlyings' to begin.")
