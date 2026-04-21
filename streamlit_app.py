@@ -9,12 +9,12 @@ import yfinance as yf
 # ---------------------------------
 # PAGE / STYLE
 # ---------------------------------
-st.set_page_config(page_title="CSP Screener - Yahoo Safe Mode", layout="wide")
+st.set_page_config(page_title="CSP Opportunity Screener", layout="wide")
 
 st.markdown("""
 <style>
     .stApp { background-color: #000000; color: #FFFFFF; }
-    [data-testid="stMetricValue"] { color: #00FF00 !important; font-size: 1.6rem !important; }
+    [data-testid="stMetricValue"] { color: #00FF00 !important; font-size: 1.7rem !important; }
     thead tr th {
         background-color: #00FF00 !important;
         color: #000000 !important;
@@ -35,7 +35,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏆 CSP Screener — Yahoo Safe Mode")
+st.title("🏆 CSP Opportunity Screener")
 
 
 # ---------------------------------
@@ -71,24 +71,29 @@ def estimate_put_delta(spot: float, strike: float, dte: int, iv: float, r: float
         return float("nan")
 
 def label_setup(score: float) -> str:
-    if score >= 0.82:
+    if score >= 0.85:
         return "Exceptional"
-    elif score >= 0.72:
+    elif score >= 0.74:
         return "Good"
-    elif score >= 0.62:
+    elif score >= 0.64:
         return "Acceptable"
     return "Pass"
 
+def premium_label(roc: float, annualized_roc: float) -> str:
+    if roc >= 0.0060 and annualized_roc >= 0.28:
+        return "Juicy"
+    elif roc >= 0.0045 and annualized_roc >= 0.22:
+        return "Decent"
+    elif roc >= 0.0035 and annualized_roc >= 0.18:
+        return "Thin"
+    return "Too Thin"
+
 
 # ---------------------------------
-# CACHED DATA FETCHERS
+# DATA FETCH
 # ---------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_last_prices_and_stats(tickers):
-    """
-    One batch request for price history.
-    This is much safer than one request per ticker.
-    """
     data = yf.download(
         tickers=tickers,
         period="3mo",
@@ -149,26 +154,26 @@ def fetch_option_chain(symbol: str, expiry: str):
 
 
 # ---------------------------------
-# LOGIC
+# UNDERLYING RANKING
 # ---------------------------------
 def rank_underlyings(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Rank names before pulling option chains.
-    We favor liquid blue-chip style names that have moved down recently
-    and have enough realized volatility to support premium.
-    """
     out = df.copy()
 
-    # More negative 5D return can be attractive for put sellers if not too extreme.
+    # Prefer names with decent realized vol and some recent pullback
     out["DownMoveScore"] = -out["Ret5D"]
     out["UnderlyingScore"] = (
         0.55 * min_max_scale(out["HV20"].fillna(0)) +
         0.45 * min_max_scale(out["DownMoveScore"].fillna(0))
     )
+
     out = out.sort_values("UnderlyingScore", ascending=False).reset_index(drop=True)
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
 
+
+# ---------------------------------
+# OPTION SCORING
+# ---------------------------------
 def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> pd.DataFrame:
     if puts.empty:
         return pd.DataFrame()
@@ -176,6 +181,7 @@ def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> 
     expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
     today = date.today()
     dte = (expiry_date - today).days
+
     if dte <= 0:
         return pd.DataFrame()
 
@@ -213,6 +219,7 @@ def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> 
         delta = estimate_put_delta(spot, strike, dte, iv, rf_rate)
         prob_otm = (1.0 + delta) if pd.notna(delta) else float("nan")
         prem_eff = (roc / abs(delta)) if pd.notna(delta) and abs(delta) > 0 else float("nan")
+        prem_label = premium_label(roc, annualized_roc)
 
         rows.append({
             "Expiry": expiry,
@@ -232,6 +239,7 @@ def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> 
             "AnnualizedROC": annualized_roc,
             "Spread_Pct": spread_pct,
             "PremiumEfficiency": prem_eff,
+            "PremiumLabel": prem_label,
             "OpenInterest": oi,
             "Volume": volume,
             "InTheMoney": itm,
@@ -239,15 +247,21 @@ def score_puts(puts: pd.DataFrame, spot: float, expiry: str, rf_rate: float) -> 
 
     return pd.DataFrame(rows)
 
-def filter_and_rank_puts(df: pd.DataFrame,
-                         min_otm_pct: float,
-                         min_be_buffer_pct: float,
-                         min_delta_abs: float,
-                         max_delta_abs: float,
-                         max_spread_pct: float,
-                         min_oi: int,
-                         min_volume: int,
-                         min_mid: float):
+
+def filter_and_rank_puts(
+    df: pd.DataFrame,
+    min_otm_pct: float,
+    min_be_buffer_pct: float,
+    min_delta_abs: float,
+    max_delta_abs: float,
+    max_spread_pct: float,
+    min_oi: int,
+    min_volume: int,
+    min_mid: float,
+    min_roc: float,
+    min_annualized_roc: float,
+    exclude_too_thin: bool,
+) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
@@ -256,6 +270,8 @@ def filter_and_rank_puts(df: pd.DataFrame,
         (df["OTM_Pct"] >= min_otm_pct) &
         (df["BE_Buffer_Pct"] >= min_be_buffer_pct) &
         (df["Mid"] >= min_mid) &
+        (df["ROC"] >= min_roc) &
+        (df["AnnualizedROC"] >= min_annualized_roc) &
         (df["OpenInterest"] >= min_oi) &
         (df["Volume"] >= min_volume) &
         (df["Spread_Pct"] <= max_spread_pct) &
@@ -266,16 +282,21 @@ def filter_and_rank_puts(df: pd.DataFrame,
     )
 
     ranked = df.loc[filt].copy()
+
+    if exclude_too_thin:
+        ranked = ranked[ranked["PremiumLabel"] != "Too Thin"].copy()
+
     if ranked.empty:
         return ranked
 
     ranked["Score"] = (
-        0.25 * min_max_scale(ranked["AnnualizedROC"]) +
-        0.20 * min_max_scale(ranked["ProbOTMEst"]) +
-        0.20 * min_max_scale(ranked["BE_Buffer_Pct"]) +
-        0.20 * min_max_scale(ranked["PremiumEfficiency"]) -
-        0.15 * min_max_scale(ranked["Spread_Pct"])
+        0.35 * min_max_scale(ranked["AnnualizedROC"]) +
+        0.25 * min_max_scale(ranked["PremiumEfficiency"]) +
+        0.15 * min_max_scale(ranked["ProbOTMEst"]) +
+        0.15 * min_max_scale(ranked["BE_Buffer_Pct"]) -
+        0.10 * min_max_scale(ranked["Spread_Pct"])
     )
+
     ranked["Setup"] = ranked["Score"].apply(label_setup)
     ranked = ranked.sort_values("Score", ascending=False).reset_index(drop=True)
     ranked.insert(0, "Rank", range(1, len(ranked) + 1))
@@ -286,26 +307,44 @@ def filter_and_rank_puts(df: pd.DataFrame,
 # SIDEBAR
 # ---------------------------------
 with st.sidebar:
-    st.header("Inputs")
+    st.header("Universe")
 
     ticker_str = st.text_area(
-        "Universe",
+        "Tickers",
         "NVDA, AAPL, MSFT, AMZN, META, AVGO, JPM, UNH, COST"
     )
     tickers = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
 
-    st.caption("Yahoo-safe mode: rank underlyings first, then fetch one chain at a time.")
+    st.caption("Yahoo-safe flow: rank names first, then fetch one option chain.")
 
-    st.subheader("Put filters")
+    st.header("Put Filters")
+
     min_otm_pct = st.slider("Min OTM %", 0.0, 20.0, 5.0, 0.5) / 100.0
     min_be_buffer_pct = st.slider("Min Break-even Buffer %", 0.0, 20.0, 6.0, 0.5) / 100.0
     min_delta_abs = st.slider("Min |Delta|", 0.01, 0.50, 0.10, 0.01)
     max_delta_abs = st.slider("Max |Delta|", 0.01, 0.50, 0.18, 0.01)
     max_spread_pct = st.slider("Max Bid/Ask Spread %", 1.0, 50.0, 10.0, 1.0) / 100.0
+
     min_oi = st.number_input("Min Open Interest", min_value=0, value=300, step=50)
     min_volume = st.number_input("Min Volume", min_value=0, value=1, step=1)
-    min_mid = st.number_input("Min Premium ($)", min_value=0.0, value=0.25, step=0.05, format="%.2f")
-    rf_rate = st.number_input("Risk-free Rate", min_value=0.0, max_value=0.15, value=0.04, step=0.005, format="%.3f")
+    min_mid = st.number_input("Min Premium ($)", min_value=0.0, value=0.35, step=0.05, format="%.2f")
+
+    st.header("Premium Floors")
+
+    min_roc = st.slider("Min ROC %", 0.0, 2.0, 0.40, 0.05) / 100.0
+    min_annualized_roc = st.slider("Min Annualized ROC %", 0.0, 100.0, 20.0, 1.0) / 100.0
+
+    exclude_too_thin = st.checkbox("Exclude 'Too Thin' premium", value=True)
+
+    st.header("Model")
+    rf_rate = st.number_input(
+        "Risk-free Rate",
+        min_value=0.0,
+        max_value=0.15,
+        value=0.04,
+        step=0.005,
+        format="%.3f"
+    )
 
 
 # ---------------------------------
@@ -313,8 +352,10 @@ with st.sidebar:
 # ---------------------------------
 if "underlying_rank" not in st.session_state:
     st.session_state["underlying_rank"] = None
+
 if "scan_error" not in st.session_state:
     st.session_state["scan_error"] = None
+
 
 # ---------------------------------
 # STEP 1: RANK UNDERLYINGS
@@ -336,15 +377,21 @@ if st.button("1) Rank Underlyings"):
 if st.session_state["scan_error"]:
     st.error(st.session_state["scan_error"])
 
+
+# ---------------------------------
+# SHOW UNDERLYING SHORTLIST
+# ---------------------------------
 underlying_rank = st.session_state["underlying_rank"]
 
 if underlying_rank is not None and not underlying_rank.empty:
     st.subheader("Underlying shortlist")
-    show_df = underlying_rank.copy()
-    show_df["Ret5D"] = (show_df["Ret5D"] * 100).round(2)
-    show_df["HV20"] = (show_df["HV20"] * 100).round(2)
-    show_df["UnderlyingScore"] = show_df["UnderlyingScore"].round(3)
-    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    shortlist_display = underlying_rank.copy()
+    shortlist_display["Ret5D"] = (shortlist_display["Ret5D"] * 100).round(2)
+    shortlist_display["HV20"] = (shortlist_display["HV20"] * 100).round(2)
+    shortlist_display["UnderlyingScore"] = shortlist_display["UnderlyingScore"].round(3)
+
+    st.dataframe(shortlist_display, use_container_width=True, hide_index=True)
 
     top_names = underlying_rank["Ticker"].head(5).tolist()
 
@@ -352,7 +399,7 @@ if underlying_rank is not None and not underlying_rank.empty:
 
     with col1:
         selected_ticker = st.selectbox(
-            "2) Pick one ticker to fetch options for",
+            "2) Pick one ticker to inspect",
             options=top_names,
             index=0
         )
@@ -370,15 +417,21 @@ if underlying_rank is not None and not underlying_rank.empty:
         )
 
     if selected_expiry:
-        if st.button("3) Fetch options for selected ticker"):
+        if st.button("3) Fetch best put opportunities"):
             try:
-                spot = float(underlying_rank.loc[underlying_rank["Ticker"] == selected_ticker, "Spot"].iloc[0])
+                spot = float(
+                    underlying_rank.loc[
+                        underlying_rank["Ticker"] == selected_ticker, "Spot"
+                    ].iloc[0]
+                )
+
                 chain = fetch_option_chain(selected_ticker, selected_expiry)
                 puts = chain.puts.copy()
 
                 scored = score_puts(puts, spot, selected_expiry, rf_rate)
+
                 ranked_puts = filter_and_rank_puts(
-                    scored,
+                    df=scored,
                     min_otm_pct=min_otm_pct,
                     min_be_buffer_pct=min_be_buffer_pct,
                     min_delta_abs=min_delta_abs,
@@ -387,25 +440,38 @@ if underlying_rank is not None and not underlying_rank.empty:
                     min_oi=min_oi,
                     min_volume=min_volume,
                     min_mid=min_mid,
+                    min_roc=min_roc,
+                    min_annualized_roc=min_annualized_roc,
+                    exclude_too_thin=exclude_too_thin,
                 )
 
-                st.subheader(f"{selected_ticker} put candidates")
+                st.subheader(f"{selected_ticker} best put opportunities")
 
                 if ranked_puts.empty:
                     st.warning("No contracts passed your filters for this ticker/expiry.")
                 else:
                     top = ranked_puts.iloc[0]
+
                     if top["Setup"] == "Pass":
                         st.warning("No special trade here right now.")
                     else:
                         st.success(
                             f"Top setup: {selected_ticker} {top['Strike']:.2f}P | "
                             f"Mid ${top['Mid']:.2f} | Delta {top['DeltaEst']:.2f} | "
-                            f"Prob OTM {top['ProbOTMEst']:.0%} | {top['Setup']}"
+                            f"Prob OTM {top['ProbOTMEst']:.0%} | "
+                            f"{top['PremiumLabel']} | {top['Setup']}"
                         )
 
                     display = ranked_puts.copy()
-                    pct_cols = ["OTM_Pct", "BE_Buffer_Pct", "ROC", "AnnualizedROC", "Spread_Pct", "ProbOTMEst"]
+
+                    pct_cols = [
+                        "OTM_Pct",
+                        "BE_Buffer_Pct",
+                        "ROC",
+                        "AnnualizedROC",
+                        "Spread_Pct",
+                        "ProbOTMEst",
+                    ]
                     for col in pct_cols:
                         display[col] = (display[col] * 100).round(2)
 
@@ -416,11 +482,28 @@ if underlying_rank is not None and not underlying_rank.empty:
 
                     st.dataframe(
                         display[[
-                            "Rank", "Setup", "Expiry", "DTE", "Spot", "Strike",
-                            "Bid", "Ask", "Mid", "DeltaEst", "ProbOTMEst",
-                            "OTM_Pct", "BE_Buffer_Pct", "ROC", "AnnualizedROC",
-                            "PremiumEfficiency", "Spread_Pct", "IV",
-                            "OpenInterest", "Volume", "Score"
+                            "Rank",
+                            "Setup",
+                            "PremiumLabel",
+                            "Expiry",
+                            "DTE",
+                            "Spot",
+                            "Strike",
+                            "Bid",
+                            "Ask",
+                            "Mid",
+                            "DeltaEst",
+                            "ProbOTMEst",
+                            "OTM_Pct",
+                            "BE_Buffer_Pct",
+                            "ROC",
+                            "AnnualizedROC",
+                            "PremiumEfficiency",
+                            "Spread_Pct",
+                            "IV",
+                            "OpenInterest",
+                            "Volume",
+                            "Score",
                         ]],
                         use_container_width=True,
                         hide_index=True
