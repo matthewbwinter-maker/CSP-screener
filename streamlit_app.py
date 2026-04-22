@@ -10,7 +10,7 @@ import yfinance as yf
 # =========================================================
 # PAGE
 # =========================================================
-st.set_page_config(page_title="High-Quality CSP Screener", layout="wide")
+st.set_page_config(page_title="Computed Put Opportunity Screener", layout="wide")
 
 st.markdown("""
 <style>
@@ -39,29 +39,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏆 High-Quality Put Opportunity Screener")
-
-
-# =========================================================
-# USER-DEFINED STOCK QUALITY
-# Adjust these to match your own conviction
-# =========================================================
-DEFAULT_QUALITY_MAP = {
-    "MSFT": 10,
-    "NVDA": 10,
-    "AAPL": 9,
-    "AMZN": 9,
-    "META": 8,
-    "AVGO": 8,
-    "GOOGL": 9,
-    "JPM": 7,
-    "UNH": 7,
-    "COST": 8,
-    "TSLA": 5,
-    "AMD": 8,
-    "NFLX": 7,
-    "LLY": 7,
-}
+st.title("🏆 Computed High-Quality Put Screener")
 
 
 # =========================================================
@@ -89,9 +67,6 @@ def min_max_scale(series: pd.Series) -> pd.Series:
     return (s - lo) / (hi - lo)
 
 def estimate_put_delta(spot: float, strike: float, dte: int, iv: float, r: float = 0.04) -> float:
-    """
-    Black-Scholes approximation for European put delta.
-    """
     if spot <= 0 or strike <= 0 or dte <= 0 or iv <= 0:
         return float("nan")
 
@@ -122,12 +97,6 @@ def premium_label(roc: float, annualized_roc: float) -> str:
         return "Thin"
     return "Too Thin"
 
-def make_quality_map(user_tickers):
-    out = {}
-    for t in user_tickers:
-        out[t] = DEFAULT_QUALITY_MAP.get(t, 6)
-    return out
-
 
 # =========================================================
 # DATA FETCH
@@ -157,12 +126,18 @@ def fetch_last_prices(tickers):
                 continue
 
             close = hist["Close"].dropna()
-            if close.empty:
+            if len(close) < 25:
                 continue
+
+            spot = float(close.iloc[-1])
+            hv20 = close.pct_change().dropna().tail(20).std() * math.sqrt(252)
+            ret_20d = spot / float(close.iloc[-21]) - 1.0 if len(close) >= 21 else float("nan")
 
             rows.append({
                 "Ticker": ticker,
-                "Spot": float(close.iloc[-1]),
+                "Spot": spot,
+                "HV20": hv20,
+                "Ret20D": ret_20d,
             })
         except Exception:
             continue
@@ -181,15 +156,9 @@ def fetch_option_chain(symbol: str, expiry: str):
 
 
 # =========================================================
-# CORE SCORING
+# OPTION BUILD
 # =========================================================
-def build_put_candidates(
-    symbol: str,
-    spot: float,
-    expiry: str,
-    rf_rate: float,
-    stock_quality: float,
-) -> pd.DataFrame:
+def build_put_candidates(symbol: str, spot: float, hv20: float, ret20d: float, expiry: str, rf_rate: float) -> pd.DataFrame:
     try:
         chain = fetch_option_chain(symbol, expiry)
         puts = chain.puts.copy()
@@ -238,14 +207,24 @@ def build_put_candidates(
         delta_est = estimate_put_delta(spot, strike, dte, iv, rf_rate)
         prob_otm_est = (1.0 + delta_est) if pd.notna(delta_est) else float("nan")
         premium_efficiency = (roc / abs(delta_est)) if pd.notna(delta_est) and abs(delta_est) > 0 else float("nan")
-        prem_label = premium_label(roc, annualized_roc)
+        premium_lbl = premium_label(roc, annualized_roc)
+
+        # computed stock quality proxy: large cap / stable / willing-to-own proxy is approximated here
+        # by using lower realized vol and avoiding names in huge 20d collapse,
+        # but still allowing enough vol for premium
+        stock_quality_proxy = (
+            0.60 * max(0.0, 1.0 - min(hv20 / 0.80, 1.0)) +   # lower realized vol better up to a point
+            0.40 * max(0.0, 1.0 - min(abs(ret20d) / 0.25, 1.0))  # avoid huge recent damage
+        )
 
         rows.append({
             "Ticker": symbol,
-            "StockQuality": stock_quality,
             "Expiry": expiry,
             "DTE": dte,
             "Spot": round(spot, 2),
+            "HV20": hv20,
+            "Ret20D": ret20d,
+            "StockQualityProxy": stock_quality_proxy,
             "Strike": strike,
             "Bid": bid,
             "Ask": ask,
@@ -260,7 +239,7 @@ def build_put_candidates(
             "AnnualizedROC": annualized_roc,
             "Spread_Pct": spread_pct,
             "PremiumEfficiency": premium_efficiency,
-            "PremiumLabel": prem_label,
+            "PremiumLabel": premium_lbl,
             "OpenInterest": oi,
             "Volume": volume,
             "InTheMoney": in_the_money,
@@ -316,20 +295,36 @@ def score_candidates(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    # Your stated priorities:
-    # 1) quality of stock
-    # 2) premium richness
-    # 3) volatility
-    # then guardrails
+    # computed option quality sub-scores
+    out["PremiumScore"] = (
+        0.70 * min_max_scale(out["AnnualizedROC"]) +
+        0.30 * min_max_scale(out["PremiumEfficiency"])
+    )
+
+    out["VolatilityScore"] = min_max_scale(out["IV"])
+
+    out["LiquidityScore"] = (
+        0.55 * min_max_scale(out["OpenInterest"]) +
+        0.25 * min_max_scale(out["Volume"]) -
+        0.20 * min_max_scale(out["Spread_Pct"])
+    )
+
+    out["SafetyScore"] = (
+        0.45 * min_max_scale(out["ProbOTMEst"]) +
+        0.35 * min_max_scale(out["BE_Buffer_Pct"]) +
+        0.20 * min_max_scale(out["OTM_Pct"])
+    )
+
+    out["StockQualityScore"] = min_max_scale(out["StockQualityProxy"])
+
+    # final score priorities:
+    # stock quality proxy first, then premium, then volatility, then guardrails
     out["Score"] = (
-        0.30 * min_max_scale(out["StockQuality"]) +
-        0.28 * min_max_scale(out["AnnualizedROC"]) +
-        0.18 * min_max_scale(out["IV"]) +
-        0.10 * min_max_scale(out["PremiumEfficiency"]) +
-        0.06 * min_max_scale(out["ProbOTMEst"]) +
-        0.05 * min_max_scale(out["BE_Buffer_Pct"]) +
-        0.03 * min_max_scale(out["OTM_Pct"]) -
-        0.10 * min_max_scale(out["Spread_Pct"])
+        0.26 * out["StockQualityScore"] +
+        0.30 * out["PremiumScore"] +
+        0.20 * out["VolatilityScore"] +
+        0.12 * out["LiquidityScore"] +
+        0.12 * out["SafetyScore"]
     )
 
     out["Setup"] = out["Score"].apply(label_setup)
@@ -349,26 +344,23 @@ def keep_best_per_ticker(df: pd.DataFrame) -> pd.DataFrame:
 
 def explain_row(row: pd.Series) -> str:
     reasons = []
-    if row["StockQuality"] >= 9:
-        reasons.append("elite stock")
-    elif row["StockQuality"] >= 8:
-        reasons.append("high-quality stock")
 
-    if row["AnnualizedROC"] >= 0.30:
+    if row["PremiumScore"] >= 0.75:
         reasons.append("strong premium")
-    elif row["AnnualizedROC"] >= 0.24:
+    elif row["PremiumScore"] >= 0.60:
         reasons.append("decent premium")
 
-    if row["IV"] >= 0.45:
+    if row["VolatilityScore"] >= 0.70:
         reasons.append("high IV")
-    elif row["IV"] >= 0.30:
-        reasons.append("solid IV")
 
-    if row["Spread_Pct"] <= 0.06:
-        reasons.append("tight spread")
+    if row["LiquidityScore"] >= 0.70:
+        reasons.append("good liquidity")
 
-    if row["BE_Buffer_Pct"] >= 0.07:
+    if row["SafetyScore"] >= 0.70:
         reasons.append("good cushion")
+
+    if row["StockQualityScore"] >= 0.70:
+        reasons.append("better underlying quality")
 
     return ", ".join(reasons[:4])
 
@@ -376,7 +368,6 @@ def explain_row(row: pd.Series) -> str:
 def run_scan(
     tickers,
     expiry,
-    quality_map,
     rf_rate,
     min_otm_pct,
     min_be_buffer_pct,
@@ -408,14 +399,16 @@ def run_scan(
                 continue
 
             spot = float(row["Spot"].iloc[0])
-            stock_quality = float(quality_map.get(ticker, 6))
+            hv20 = float(row["HV20"].iloc[0])
+            ret20d = float(row["Ret20D"].iloc[0])
 
             cands = build_put_candidates(
                 symbol=ticker,
                 spot=spot,
+                hv20=hv20,
+                ret20d=ret20d,
                 expiry=expiry,
                 rf_rate=rf_rate,
-                stock_quality=stock_quality,
             )
 
             if cands.empty:
@@ -440,8 +433,6 @@ def run_scan(
                 continue
 
             all_candidates.append(filtered)
-
-            # Be gentler with Yahoo
             time.sleep(1.2)
 
         except Exception:
@@ -468,23 +459,10 @@ with st.sidebar:
     st.header("Universe")
 
     ticker_str = st.text_area(
-        "Tickers (keep this to ~4-8 names on Yahoo)",
+        "Tickers (keep to ~4-8 names on Yahoo)",
         "NVDA, MSFT, AAPL, AMZN, META, AVGO"
     )
     tickers = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
-
-    quality_map = make_quality_map(tickers)
-
-    st.subheader("Stock Quality Scores")
-    st.caption("10 = best quality / strongest willingness to own")
-    for t in tickers:
-        quality_map[t] = st.slider(
-            f"{t} quality",
-            min_value=1,
-            max_value=10,
-            value=int(quality_map[t]),
-            step=1
-        )
 
     st.subheader("Expiry")
     expiry_source_ticker = tickers[0] if tickers else "NVDA"
@@ -496,13 +474,11 @@ with st.sidebar:
         expirations = []
 
     if expirations:
-        default_idx = 0
-        expiry = st.selectbox("Choose expiry", options=expirations, index=default_idx)
+        expiry = st.selectbox("Choose expiry", options=expirations, index=0)
     else:
         expiry = st.text_input("Expiry (YYYY-MM-DD)", "2026-04-24")
 
     st.subheader("Core Filters")
-
     min_otm_pct = st.slider("Min OTM %", 0.0, 20.0, 5.0, 0.5) / 100.0
     min_be_buffer_pct = st.slider("Min Break-even Buffer %", 0.0, 20.0, 6.0, 0.5) / 100.0
     min_delta_abs = st.slider("Min |Delta|", 0.01, 0.50, 0.10, 0.01)
@@ -548,7 +524,6 @@ if st.button("🚀 Scan Best High-Quality Put Opportunities", type="primary"):
         results, error = run_scan(
             tickers=tickers,
             expiry=expiry,
-            quality_map=quality_map,
             rf_rate=rf_rate,
             min_otm_pct=min_otm_pct,
             min_be_buffer_pct=min_be_buffer_pct,
@@ -594,21 +569,26 @@ else:
     display = results.copy()
 
     pct_cols = [
-        "IV", "OTM_Pct", "BE_Buffer_Pct", "ROC",
+        "HV20", "IV", "OTM_Pct", "BE_Buffer_Pct", "ROC",
         "AnnualizedROC", "Spread_Pct", "ProbOTMEst"
     ]
     for col in pct_cols:
         display[col] = (display[col] * 100).round(2)
 
+    score_cols = [
+        "StockQualityScore", "PremiumScore", "VolatilityScore",
+        "LiquidityScore", "SafetyScore", "Score"
+    ]
+    for col in score_cols:
+        display[col] = display[col].round(3)
+
     display["DeltaEst"] = display["DeltaEst"].round(3)
     display["PremiumEfficiency"] = display["PremiumEfficiency"].round(4)
-    display["Score"] = display["Score"].round(3)
 
     st.dataframe(
         display[[
             "Rank",
             "Ticker",
-            "StockQuality",
             "Setup",
             "PremiumLabel",
             "Expiry",
@@ -624,11 +604,17 @@ else:
             "BE_Buffer_Pct",
             "ROC",
             "AnnualizedROC",
+            "HV20",
             "IV",
             "PremiumEfficiency",
-            "Spread_Pct",
             "OpenInterest",
             "Volume",
+            "Spread_Pct",
+            "StockQualityScore",
+            "PremiumScore",
+            "VolatilityScore",
+            "LiquidityScore",
+            "SafetyScore",
             "Score",
             "WhyItRanked",
         ]],
@@ -636,7 +622,4 @@ else:
         hide_index=True
     )
 
-    st.caption(
-        "This ranks the best surviving put per ticker. "
-        "If Yahoo rate-limits, reduce the universe to 4-6 names."
-    )
+    st.caption("All quality measures are computed by the model; nothing is manually scored.")
