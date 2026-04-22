@@ -4,11 +4,11 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(page_title="CSP Screener", layout="wide")
-st.title("🏆 CSP Screener (Works Version)")
+st.title("🏆 CSP Screener (Stable Version)")
 
-# -----------------------------
+# =========================
 # INPUT
-# -----------------------------
+# =========================
 ticker_input = st.text_input(
     "Enter tickers (comma separated)",
     "NVDA, MSFT, AAPL, AMZN"
@@ -16,12 +16,12 @@ ticker_input = st.text_input(
 
 tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
-otm_pct = st.slider("OTM %", 2, 15, 6)
+otm_pct = st.slider("Target OTM %", 2, 15, 6)
 dte = st.slider("Days to Expiration", 5, 14, 7)
 
-# -----------------------------
+# =========================
 # FUNCTIONS
-# -----------------------------
+# =========================
 def get_data(ticker):
     try:
         df = yf.download(
@@ -37,12 +37,32 @@ def get_data(ticker):
     except:
         return None
 
-def calc_vol(close):
-    return close.pct_change().dropna().tail(20).std() * math.sqrt(252)
+def extract_close(df):
+    if "Close" not in df.columns:
+        return None
 
-# -----------------------------
+    close = df["Close"]
+
+    # fix weird yfinance structure
+    if isinstance(close, pd.DataFrame):
+        close = close.squeeze()
+
+    close = close.dropna()
+
+    if close.empty:
+        return None
+
+    return close
+
+def calc_vol(close):
+    returns = close.pct_change().dropna()
+    if len(returns) < 10:
+        return None
+    return returns.tail(20).std() * math.sqrt(252)
+
+# =========================
 # RUN
-# -----------------------------
+# =========================
 if st.button("🚀 Run Screener"):
 
     results = []
@@ -53,37 +73,42 @@ if st.button("🚀 Run Screener"):
 
         df = get_data(t)
 
-        if df is None or "Close" not in df:
-            results.append({
-                "Ticker": t,
-                "Status": "No data"
-            })
+        if df is None:
+            results.append({"Ticker": t, "Status": "No data"})
             continue
 
-        close = df["Close"].dropna()
+        close = extract_close(df)
 
-        if len(close) < 25:
-            results.append({
-                "Ticker": t,
-                "Status": "Not enough data"
-            })
+        if close is None or len(close) < 20:
+            results.append({"Ticker": t, "Status": "Bad data"})
             continue
 
-        price = float(close.iloc[-1])
+        try:
+            price = float(close.values[-1])
+        except:
+            results.append({"Ticker": t, "Status": "Price error"})
+            continue
+
         hv = calc_vol(close)
 
-        # estimate IV (simple but stable)
+        if hv is None:
+            results.append({"Ticker": t, "Status": "Vol error"})
+            continue
+
+        # implied vol proxy
         iv = hv * 1.3
 
+        # strike
         strike = price * (1 - otm_pct / 100)
 
-        # simple premium model
+        # premium model (stable approximation)
         time_factor = math.sqrt(dte / 365)
         premium = price * iv * time_factor * 0.3
 
         roc = premium / strike
         annual = roc * (365 / dte)
 
+        # scoring (premium + vol focus)
         score = (
             0.4 * roc +
             0.3 * iv +
@@ -112,7 +137,6 @@ if st.button("🚀 Run Screener"):
 
     st.dataframe(df, use_container_width=True)
 
-    # top pick
     valid = df[df["Status"] == "OK"]
 
     if not valid.empty:
@@ -122,4 +146,4 @@ if st.button("🚀 Run Screener"):
             f"Premium ${top['Est Premium']} | ROC {top['ROC %']}%"
         )
     else:
-        st.warning("No valid tickers returned data.")
+        st.warning("No valid tickers returned usable data.")
