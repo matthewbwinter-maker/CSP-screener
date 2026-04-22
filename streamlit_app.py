@@ -3,124 +3,123 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Reliable CSP Screener", layout="wide")
-st.title("🏆 Reliable CSP Opportunity Screener")
+st.set_page_config(page_title="CSP Screener", layout="wide")
+st.title("🏆 CSP Screener (Works Version)")
 
-# =========================================================
+# -----------------------------
 # INPUT
-# =========================================================
-ticker_str = st.text_area(
-    "Tickers (keep to 4–10)",
-    "NVDA, MSFT, AAPL, AMZN, META, AVGO"
+# -----------------------------
+ticker_input = st.text_input(
+    "Enter tickers (comma separated)",
+    "NVDA, MSFT, AAPL, AMZN"
 )
 
-tickers = [t.strip().upper() for t in ticker_str.split(",") if t.strip()]
+tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
-otm_target = st.slider("Target OTM %", 2, 15, 6)
-dte = st.slider("Days to Expiration (approx)", 5, 14, 7)
+otm_pct = st.slider("OTM %", 2, 15, 6)
+dte = st.slider("Days to Expiration", 5, 14, 7)
 
-# =========================================================
-# HELPERS
-# =========================================================
-def annualize(x, dte):
-    return x * (365 / dte)
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-# =========================================================
-# FETCH PRICE DATA (ROBUST)
-# =========================================================
-@st.cache_data(ttl=300)
-def fetch_data(tickers):
-    data = yf.download(
-        tickers,
-        period="3mo",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False
-    )
-    return data
-
-data = fetch_data(tickers)
-
-# =========================================================
-# BUILD SCREEN
-# =========================================================
-rows = []
-
-for t in tickers:
+# -----------------------------
+# FUNCTIONS
+# -----------------------------
+def get_data(ticker):
     try:
-        df = data[t] if len(tickers) > 1 else data
+        df = yf.download(
+            ticker,
+            period="3mo",
+            interval="1d",
+            progress=False,
+            threads=False
+        )
+        if df is None or df.empty:
+            return None
+        return df
+    except:
+        return None
 
-        if "Close" not in df:
+def calc_vol(close):
+    return close.pct_change().dropna().tail(20).std() * math.sqrt(252)
+
+# -----------------------------
+# RUN
+# -----------------------------
+if st.button("🚀 Run Screener"):
+
+    results = []
+    status = st.empty()
+
+    for t in tickers:
+        status.write(f"Scanning {t}...")
+
+        df = get_data(t)
+
+        if df is None or "Close" not in df:
+            results.append({
+                "Ticker": t,
+                "Status": "No data"
+            })
             continue
 
         close = df["Close"].dropna()
 
         if len(close) < 25:
+            results.append({
+                "Ticker": t,
+                "Status": "Not enough data"
+            })
             continue
 
-        spot = float(close.iloc[-1])
+        price = float(close.iloc[-1])
+        hv = calc_vol(close)
 
-        # realized vol (proxy)
-        hv20 = close.pct_change().dropna().tail(20).std() * math.sqrt(252)
+        # estimate IV (simple but stable)
+        iv = hv * 1.3
 
-        # target strike
-        strike = spot * (1 - otm_target / 100)
+        strike = price * (1 - otm_pct / 100)
 
-        # simple premium model:
-        # premium ~ IV * sqrt(time) * price * scaling factor
-        iv_proxy = hv20 * 1.25  # inflate realized vol → implied-ish
-
+        # simple premium model
         time_factor = math.sqrt(dte / 365)
+        premium = price * iv * time_factor * 0.3
 
-        est_premium = spot * iv_proxy * time_factor * 0.35
-
-        roc = est_premium / strike
-        annualized = annualize(roc, dte)
-
-        # scoring
-        premium_score = roc
-        vol_score = iv_proxy
-        quality_score = 1 / (1 + hv20)  # lower chaos = better stock
+        roc = premium / strike
+        annual = roc * (365 / dte)
 
         score = (
-            0.35 * premium_score +
-            0.30 * vol_score +
-            0.20 * quality_score +
-            0.15 * annualized
+            0.4 * roc +
+            0.3 * iv +
+            0.2 * (1 / (1 + hv)) +
+            0.1 * annual
         )
 
-        rows.append({
+        results.append({
             "Ticker": t,
-            "Price": round(spot, 2),
+            "Price": round(price, 2),
             "Strike": round(strike, 2),
-            "Est Premium": round(est_premium, 2),
+            "Est Premium": round(premium, 2),
             "ROC %": round(roc * 100, 2),
-            "Annual %": round(annualized * 100, 1),
-            "HV20 %": round(hv20 * 100, 1),
-            "Score": score
+            "Annual %": round(annual * 100, 1),
+            "Vol %": round(hv * 100, 1),
+            "Score": round(score, 4),
+            "Status": "OK"
         })
 
-    except Exception:
-        continue
+    status.empty()
 
-# =========================================================
-# DISPLAY
-# =========================================================
-if not rows:
-    st.error("No data returned. Reduce tickers.")
-else:
-    df = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
-    df.insert(0, "Rank", range(1, len(df) + 1))
+    df = pd.DataFrame(results)
 
-    top = df.iloc[0]
+    if "Score" in df.columns:
+        df = df.sort_values("Score", ascending=False)
 
-    st.success(
-        f"🥇 TOP: {top['Ticker']} | Strike {top['Strike']} | "
-        f"Premium ${top['Est Premium']} | ROC {top['ROC %']}%"
-    )
+    st.dataframe(df, use_container_width=True)
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    # top pick
+    valid = df[df["Status"] == "OK"]
+
+    if not valid.empty:
+        top = valid.iloc[0]
+        st.success(
+            f"TOP: {top['Ticker']} | Strike {top['Strike']} | "
+            f"Premium ${top['Est Premium']} | ROC {top['ROC %']}%"
+        )
+    else:
+        st.warning("No valid tickers returned data.")
