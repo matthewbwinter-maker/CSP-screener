@@ -1,85 +1,82 @@
-import math
 import time
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Real CSP Screener", layout="wide")
-st.title("🏆 Real CSP Opportunity Screener")
+st.set_page_config(page_title="30 Ticker CSP Screener", layout="wide")
+st.title("🏆 30 Blue Chip CSP Screener")
 
 # =========================
-# INPUT
+# DEFAULT UNIVERSE
 # =========================
-ticker_input = st.text_input(
-    "Enter tickers (keep to 3–6)",
-    "NVDA, MSFT, AAPL"
-)
+DEFAULT_TICKERS = """
+AAPL, MSFT, NVDA, AMZN, META, GOOGL, AVGO, TSLA,
+JPM, BAC, GS, UNH, LLY, COST, WMT, HD,
+PEP, KO, MCD, NKE, DIS, CRM, ORCL, CSCO,
+AMD, QCOM, TXN, INTC, IBM, CAT
+"""
 
+ticker_input = st.text_area("Tickers", DEFAULT_TICKERS)
 tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
-
-target_delta_low = st.slider("Min Delta", 0.05, 0.30, 0.10)
-target_delta_high = st.slider("Max Delta", 0.05, 0.40, 0.20)
 
 min_premium = st.slider("Min Premium ($)", 0.1, 5.0, 0.5)
 min_roc = st.slider("Min ROC %", 0.0, 2.0, 0.3) / 100
 
+batch_size = 5  # CRITICAL for Yahoo stability
+
 # =========================
-# HELPERS
+# SAFE FETCH
 # =========================
-def safe_float(x):
+@st.cache_data(ttl=300)
+def fetch_chain(ticker):
     try:
-        return float(x)
+        tk = yf.Ticker(ticker)
+        exps = tk.options
+        if not exps:
+            return None
+
+        expiry = exps[0]
+        chain = tk.option_chain(expiry)
+
+        if chain is None or chain.puts is None:
+            return None
+
+        return (expiry, chain.puts)
     except:
         return None
 
-# =========================
-# MAIN
-# =========================
-if st.button("🚀 Run Screener"):
 
+# =========================
+# SCAN FUNCTION
+# =========================
+def scan_batch(batch):
     results = []
-    status = st.empty()
 
-    for t in tickers:
-        status.write(f"Scanning {t}...")
+    for t in batch:
+        data = fetch_chain(t)
 
-        try:
-            tk = yf.Ticker(t)
+        if data is None:
+            results.append({"Ticker": t, "Status": "No data"})
+            continue
 
-            expirations = tk.options
-            if not expirations:
-                results.append({"Ticker": t, "Status": "No expirations"})
-                continue
+        expiry, puts = data
 
-            expiry = expirations[0]  # nearest weekly
+        best = None
+        best_score = -1
 
-            chain = tk.option_chain(expiry)
-            puts = chain.puts
+        for _, row in puts.iterrows():
+            try:
+                strike = float(row["strike"])
+                bid = float(row["bid"])
+                ask = float(row["ask"])
+                iv = float(row.get("impliedVolatility", 0))
+                oi = float(row.get("openInterest", 0))
+                vol = float(row.get("volume", 0))
 
-            if puts is None or puts.empty:
-                results.append({"Ticker": t, "Status": "No puts"})
-                continue
-
-            best_row = None
-            best_score = -1
-
-            for _, row in puts.iterrows():
-
-                strike = safe_float(row.get("strike"))
-                bid = safe_float(row.get("bid"))
-                ask = safe_float(row.get("ask"))
-                iv = safe_float(row.get("impliedVolatility"))
-                oi = safe_float(row.get("openInterest"))
-                vol = safe_float(row.get("volume"))
-
-                if not strike or strike <= 0:
+                if bid <= 0 or ask <= 0:
                     continue
 
-                mid = None
-                if bid and ask and ask >= bid:
-                    mid = (bid + ask) / 2
-                else:
-                    continue
+                mid = (bid + ask) / 2
 
                 if mid < min_premium:
                     continue
@@ -88,58 +85,68 @@ if st.button("🚀 Run Screener"):
                 if roc < min_roc:
                     continue
 
-                # crude delta proxy from moneyness
-                # (yahoo delta often missing)
-                # deeper OTM = lower delta
-                # normalize approx
-                price = strike / (1 - 0.10)  # rough reverse assumption
-                delta_est = mid / price if price else 0.1
-
-                if not (target_delta_low <= abs(delta_est) <= target_delta_high):
-                    continue
-
-                spread = (ask - bid) / mid if mid > 0 else 1
-
+                spread = (ask - bid) / mid
                 if spread > 0.25:
                     continue
 
                 score = (
                     0.4 * roc +
-                    0.3 * (iv if iv else 0) +
+                    0.3 * iv +
                     0.2 * (1 / (1 + spread)) +
-                    0.1 * (oi if oi else 0) / 1000
+                    0.1 * (oi / 1000)
                 )
 
                 if score > best_score:
                     best_score = score
-                    best_row = {
+                    best = {
                         "Ticker": t,
                         "Expiry": expiry,
                         "Strike": strike,
                         "Premium": round(mid, 2),
                         "ROC %": round(roc * 100, 2),
-                        "IV %": round((iv or 0) * 100, 1),
-                        "Spread %": round(spread * 100, 1),
-                        "OI": int(oi or 0),
-                        "Volume": int(vol or 0),
+                        "IV %": round(iv * 100, 1),
+                        "OI": int(oi),
+                        "Volume": int(vol),
                         "Score": round(score, 4),
                         "Status": "OK"
                     }
 
-            if best_row:
-                results.append(best_row)
-            else:
-                results.append({"Ticker": t, "Status": "No valid contracts"})
+            except:
+                continue
 
-            time.sleep(1.2)  # avoid rate limit
+        if best:
+            results.append(best)
+        else:
+            results.append({"Ticker": t, "Status": "No valid contracts"})
 
-        except Exception:
-            results.append({"Ticker": t, "Status": "Error / Rate limited"})
-            continue
+    return results
 
+
+# =========================
+# RUN
+# =========================
+if st.button("🚀 Scan All 30 Tickers"):
+
+    all_results = []
+    progress = st.progress(0)
+    status = st.empty()
+
+    batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+
+    for i, batch in enumerate(batches):
+        status.write(f"Scanning batch {i+1}/{len(batches)}...")
+
+        batch_results = scan_batch(batch)
+        all_results.extend(batch_results)
+
+        progress.progress((i+1)/len(batches))
+
+        time.sleep(2)  # CRITICAL anti-rate-limit
+
+    progress.empty()
     status.empty()
 
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(all_results)
 
     if "Score" in df.columns:
         df = df.sort_values("Score", ascending=False)
@@ -155,4 +162,4 @@ if st.button("🚀 Run Screener"):
             f"Premium ${top['Premium']} | ROC {top['ROC %']}%"
         )
     else:
-        st.warning("No good trades found right now.")
+        st.warning("No strong CSP setups right now.")
