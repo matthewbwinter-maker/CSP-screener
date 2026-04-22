@@ -1,13 +1,13 @@
-import time
+import math
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="30 Ticker CSP Screener", layout="wide")
-st.title("🏆 30 Blue Chip CSP Screener")
+st.set_page_config(page_title="CSP Screener", layout="wide")
+st.title("🏆 Reliable CSP Screener (Real-World Workflow)")
 
 # =========================
-# DEFAULT UNIVERSE
+# INPUT
 # =========================
 DEFAULT_TICKERS = """
 AAPL, MSFT, NVDA, AMZN, META, GOOGL, AVGO, TSLA,
@@ -19,147 +19,111 @@ AMD, QCOM, TXN, INTC, IBM, CAT
 ticker_input = st.text_area("Tickers", DEFAULT_TICKERS)
 tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
-min_premium = st.slider("Min Premium ($)", 0.1, 5.0, 0.5)
-min_roc = st.slider("Min ROC %", 0.0, 2.0, 0.3) / 100
-
-batch_size = 5  # CRITICAL for Yahoo stability
+otm_target = st.slider("Target OTM % (5–10 ideal)", 2, 15, 6)
+dte = st.slider("Days to Expiration (5–10 ideal)", 5, 14, 7)
 
 # =========================
-# SAFE FETCH
+# FUNCTIONS
 # =========================
-@st.cache_data(ttl=300)
-def fetch_chain(ticker):
+def get_price_data(ticker):
     try:
-        tk = yf.Ticker(ticker)
-        exps = tk.options
-        if not exps:
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if df is None or df.empty:
             return None
-
-        expiry = exps[0]
-        chain = tk.option_chain(expiry)
-
-        if chain is None or chain.puts is None:
-            return None
-
-        return (expiry, chain.puts)
+        return df
     except:
         return None
 
+def get_close_series(df):
+    if "Close" not in df.columns:
+        return None
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.squeeze()
+    close = close.dropna()
+    if close.empty:
+        return None
+    return close
 
-# =========================
-# SCAN FUNCTION
-# =========================
-def scan_batch(batch):
-    results = []
-
-    for t in batch:
-        data = fetch_chain(t)
-
-        if data is None:
-            results.append({"Ticker": t, "Status": "No data"})
-            continue
-
-        expiry, puts = data
-
-        best = None
-        best_score = -1
-
-        for _, row in puts.iterrows():
-            try:
-                strike = float(row["strike"])
-                bid = float(row["bid"])
-                ask = float(row["ask"])
-                iv = float(row.get("impliedVolatility", 0))
-                oi = float(row.get("openInterest", 0))
-                vol = float(row.get("volume", 0))
-
-                if bid <= 0 or ask <= 0:
-                    continue
-
-                mid = (bid + ask) / 2
-
-                if mid < min_premium:
-                    continue
-
-                roc = mid / strike
-                if roc < min_roc:
-                    continue
-
-                spread = (ask - bid) / mid
-                if spread > 0.25:
-                    continue
-
-                score = (
-                    0.4 * roc +
-                    0.3 * iv +
-                    0.2 * (1 / (1 + spread)) +
-                    0.1 * (oi / 1000)
-                )
-
-                if score > best_score:
-                    best_score = score
-                    best = {
-                        "Ticker": t,
-                        "Expiry": expiry,
-                        "Strike": strike,
-                        "Premium": round(mid, 2),
-                        "ROC %": round(roc * 100, 2),
-                        "IV %": round(iv * 100, 1),
-                        "OI": int(oi),
-                        "Volume": int(vol),
-                        "Score": round(score, 4),
-                        "Status": "OK"
-                    }
-
-            except:
-                continue
-
-        if best:
-            results.append(best)
-        else:
-            results.append({"Ticker": t, "Status": "No valid contracts"})
-
-    return results
-
+def calc_vol(close):
+    returns = close.pct_change().dropna()
+    if len(returns) < 10:
+        return None
+    return returns.tail(20).std() * math.sqrt(252)
 
 # =========================
 # RUN
 # =========================
-if st.button("🚀 Scan All 30 Tickers"):
+if st.button("🚀 Scan Opportunities"):
 
-    all_results = []
-    progress = st.progress(0)
+    results = []
     status = st.empty()
 
-    batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+    for t in tickers:
+        status.write(f"Scanning {t}...")
 
-    for i, batch in enumerate(batches):
-        status.write(f"Scanning batch {i+1}/{len(batches)}...")
+        df = get_price_data(t)
+        if df is None:
+            continue
 
-        batch_results = scan_batch(batch)
-        all_results.extend(batch_results)
+        close = get_close_series(df)
+        if close is None or len(close) < 20:
+            continue
 
-        progress.progress((i+1)/len(batches))
+        try:
+            price = float(close.values[-1])
+        except:
+            continue
 
-        time.sleep(2)  # CRITICAL anti-rate-limit
+        hv = calc_vol(close)
+        if hv is None:
+            continue
 
-    progress.empty()
+        # implied vol proxy
+        iv = hv * 1.3
+
+        # target strike
+        strike = price * (1 - otm_target / 100)
+
+        # expected move (real trading concept)
+        expected_move = price * iv * math.sqrt(dte / 365)
+
+        # realistic premium zone (not fake precision)
+        premium_low = expected_move * 0.25
+        premium_high = expected_move * 0.40
+
+        roc_low = premium_low / strike
+        roc_high = premium_high / strike
+
+        score = (
+            0.4 * roc_high +
+            0.3 * iv +
+            0.2 * (1 / (1 + hv)) +
+            0.1 * roc_low
+        )
+
+        results.append({
+            "Ticker": t,
+            "Price": round(price, 2),
+            "Target Strike": round(strike, 2),
+            "Premium Range": f"${round(premium_low,2)} - ${round(premium_high,2)}",
+            "ROC Range %": f"{round(roc_low*100,2)} - {round(roc_high*100,2)}",
+            "Vol %": round(hv * 100, 1),
+            "Score": round(score, 4)
+        })
+
     status.empty()
 
-    df = pd.DataFrame(all_results)
-
-    if "Score" in df.columns:
-        df = df.sort_values("Score", ascending=False)
-
-    st.dataframe(df, use_container_width=True)
-
-    valid = df[df["Status"] == "OK"]
-
-    if not valid.empty:
-        top = valid.iloc[0]
-        st.success(
-            f"TOP: {top['Ticker']} {top['Strike']}P | "
-            f"Premium ${top['Premium']} | ROC {top['ROC %']}%"
-        )
+    if not results:
+        st.error("No data returned — reduce tickers or check connection.")
     else:
-        st.warning("No strong CSP setups right now.")
+        df = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
+        df.insert(0, "Rank", range(1, len(df) + 1))
+
+        st.dataframe(df, use_container_width=True)
+
+        top = df.iloc[0]
+        st.success(
+            f"TOP: {top['Ticker']} → Sell ~{top['Target Strike']} Put | "
+            f"Premium Range {top['Premium Range']}"
+        )
